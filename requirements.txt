@@ -1,0 +1,22 @@
+# APK Obfuscation Analyzer Dependencies
+
+# No Python dependencies required for basic functionality
+# The tool relies on jadx (external tool) for APK decompilation
+
+# Optional: For enhanced analysis features
+# androguard>=3.4.0  # Advanced APK analysis (optional)
+# matplotlib>=3.5.0  # For generating charts (optional)
+# pandas>=1.5.0      # For data analysis (optional)
+
+# Note: jadx must be installed separately
+# Installation instructions: https://github.com/skylot/jadx
+#
+# On Ubuntu/Debian:
+#   sudo apt-get install jadx
+#
+# On macOS:
+#   brew install jadx
+#
+# Manual installation:
+#   Download from https://github.com/skylot/jadx/releases
+#   Extract and add to PATH
