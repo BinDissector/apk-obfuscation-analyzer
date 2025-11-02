@@ -1,5 +1,12 @@
 # APK/AAR Obfuscation Analyzer
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
+[![Status](https://img.shields.io/badge/status-active-success.svg)]()
+[![GitHub Issues](https://img.shields.io/github/issues/BinDissector/apk-obfuscation-analyzer.svg)](https://github.com/BinDissector/apk-obfuscation-analyzer/issues)
+[![GitHub Stars](https://img.shields.io/github/stars/BinDissector/apk-obfuscation-analyzer.svg)](https://github.com/BinDissector/apk-obfuscation-analyzer/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/BinDissector/apk-obfuscation-analyzer.svg)](https://github.com/BinDissector/apk-obfuscation-analyzer/network)
+
 A comprehensive tool for analyzing and measuring the effectiveness of Android APK and AAR obfuscation techniques. **Verify your app is properly obfuscated before releasing it to users.**
 
 > **👋 New here?** Read **[START_HERE.md](START_HERE.md)** to choose the best guide for you!
