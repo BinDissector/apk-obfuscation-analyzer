@@ -103,7 +103,7 @@ jadx --version
 
 1. Clone or download this repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/BinDissector/apk-obfuscation-analyzer.git
 cd apk-obfuscation-analyzer
 ```
 
