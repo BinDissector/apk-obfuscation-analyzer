@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Affects `_validate_apk_aar_structure()` method at line 1484
   - All file validation and CRC checks now work correctly
 
+- **Critical**: Fixed `FileNotFoundError` in cryptography analysis
+  - `analyze_cryptography()` was iterating over directory path string instead of files
+  - Caused "Failed to analyze crypto in p: [Errno 2] No such file or directory: 'p'" warnings
+  - Error occurred because function expected list of files but received directory path
+  - When iterating string "/tmp/sources", Python iterated characters: '/', 't', 'm', 'p', etc.
+  - Fixed by changing function to accept `sources_dir` and use `os.walk()` like other analysis functions
+  - Cryptographic analysis now works correctly and detects hardcoded keys, weak algorithms, etc.
+
 ## [1.0.0] - 2025-01-01
 
 ### Fixed

@@ -1592,7 +1592,7 @@ class APKAnalyzer:
 
         return validation
 
-    def analyze_cryptography(self, sources):
+    def analyze_cryptography(self, sources_dir):
         """
         Analyze cryptographic operations, keys, parameters, and security practices
 
@@ -1605,7 +1605,7 @@ class APKAnalyzer:
         - Security vulnerabilities and best practices
 
         Args:
-            sources: List of decompiled source file paths
+            sources_dir: Directory containing decompiled source files
 
         Returns:
             Dictionary with comprehensive cryptographic analysis
@@ -1719,10 +1719,16 @@ class APKAnalyzer:
             'nonce': r'(nonce\s*=|NONCE\s*=)',
         }
 
-        for source_file in sources:
-            try:
-                with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
+        # Walk through all Java files in the sources directory
+        for root, dirs, files in os.walk(sources_dir):
+            for file in files:
+                if not file.endswith('.java'):
+                    continue
+
+                source_file = os.path.join(root, file)
+                try:
+                    with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
 
                     # Skip empty files
                     if not content.strip():
@@ -2017,10 +2023,10 @@ class APKAnalyzer:
                                 elif param_type == 'nonce':
                                     crypto_analysis['crypto_parameters']['hardcoded_nonces'].append(param_entry)
 
-            except Exception as e:
-                if self.verbose:
-                    print(f"Warning: Failed to analyze crypto in {source_file}: {e}")
-                continue
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Warning: Failed to analyze crypto in {source_file}: {e}")
+                    continue
 
         # Generate security issues and recommendations
         self._assess_crypto_security(crypto_analysis)
