@@ -12,6 +12,7 @@ import argparse
 import subprocess
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -1241,6 +1242,992 @@ class APKAnalyzer:
 
         return metrics
 
+    def analyze_resources(self, apk_path):
+        """
+        Analyze resources.arsc for resource obfuscation
+
+        Requires: pip install androguard (optional)
+        If androguard is not available, returns None and analysis continues without resource metrics.
+
+        Args:
+            apk_path: Path to APK or AAR file
+
+        Returns:
+            Dictionary with resource metrics, or None if androguard unavailable
+        """
+        try:
+            from androguard.core.axml import ARSCParser
+        except ImportError:
+            if self.verbose:
+                print("Note: androguard not installed. Skipping resource analysis.")
+                print("      Install with: pip install androguard")
+            return None
+
+        self.log("Analyzing resources.arsc...")
+
+        try:
+            # Parse resources.arsc
+            arsc = ARSCParser(apk_path)
+
+            metrics = {
+                'resource_names': {
+                    'total_resources': 0,
+                    'obfuscated_names': 0,      # Single char or very short
+                    'meaningful_names': 0,       # Contains dictionary words
+                    'avg_name_length': 0.0,
+                    'short_names': 0,            # <= 2 chars
+                    'very_short_names': 0,       # Single char
+                },
+                'string_resources': {
+                    'total_strings': 0,
+                    'encrypted_strings': 0,      # High entropy strings
+                    'base64_strings': 0,
+                    'avg_string_entropy': 0.0,
+                    'high_entropy_strings': 0,   # Entropy > 4.5
+                },
+                'resource_types': {},
+                'package_names': [],
+                'obfuscation_indicators': {
+                    'high_obfuscated_ratio': False,
+                    'sequential_naming': False,
+                    'short_name_dominance': False,
+                    'encrypted_string_ratio': False,
+                }
+            }
+
+            resource_names = []
+            string_values = []
+            string_entropies = []
+
+            # Iterate through all packages
+            for package in arsc.get_packages_names():
+                metrics['package_names'].append(package)
+
+                # Iterate through resource types (drawable, layout, string, etc.)
+                for res_type in arsc.get_types(package):
+                    # Extract type name (remove 'type ' prefix if present)
+                    type_name = res_type.replace('type ', '') if res_type.startswith('type ') else res_type
+
+                    # Initialize type counter
+                    if type_name not in metrics['resource_types']:
+                        metrics['resource_types'][type_name] = 0
+
+                    # Get all resource names for this type
+                    try:
+                        res_names = arsc.get_resources_names(package, res_type)
+                        if not res_names:
+                            continue
+
+                        for res_name in res_names:
+                            if not res_name:
+                                continue
+
+                            metrics['resource_names']['total_resources'] += 1
+                            metrics['resource_types'][type_name] += 1
+
+                            resource_names.append(res_name)
+
+                            # Analyze resource name obfuscation
+                            name_len = len(res_name)
+
+                            if name_len == 1:
+                                metrics['resource_names']['very_short_names'] += 1
+                                metrics['resource_names']['obfuscated_names'] += 1
+
+                            if name_len <= 2:
+                                metrics['resource_names']['short_names'] += 1
+
+                            # Check if name contains meaningful words
+                            name_lower = res_name.lower()
+                            if any(word in name_lower for word in self.dictionary_words):
+                                metrics['resource_names']['meaningful_names'] += 1
+
+                            # Analyze string resource values
+                            if type_name == 'string':
+                                try:
+                                    # get_string returns (resource_id, value)
+                                    string_data = arsc.get_string(package, res_name)
+                                    if string_data and len(string_data) > 1:
+                                        string_value = string_data[1]
+
+                                        if string_value and isinstance(string_value, str) and len(string_value) > 0:
+                                            metrics['string_resources']['total_strings'] += 1
+                                            string_values.append(string_value)
+
+                                            # Calculate entropy
+                                            entropy = self._calculate_entropy(string_value)
+                                            string_entropies.append(entropy)
+
+                                            # High entropy indicates encryption
+                                            if entropy > 4.5:
+                                                metrics['string_resources']['high_entropy_strings'] += 1
+                                                metrics['string_resources']['encrypted_strings'] += 1
+
+                                            # Check for Base64
+                                            if self._is_base64(string_value):
+                                                metrics['string_resources']['base64_strings'] += 1
+                                except Exception as e:
+                                    self.log(f"Error processing string resource {res_name}: {e}")
+
+                    except Exception as e:
+                        self.log(f"Error processing resource type {res_type}: {e}")
+
+            # Calculate averages
+            if resource_names:
+                metrics['resource_names']['avg_name_length'] = sum(len(n) for n in resource_names) / len(resource_names)
+
+            if string_entropies:
+                metrics['string_resources']['avg_string_entropy'] = sum(string_entropies) / len(string_entropies)
+
+            # Detect obfuscation patterns
+            total_resources = metrics['resource_names']['total_resources']
+            if total_resources > 0:
+                obfuscated_ratio = metrics['resource_names']['obfuscated_names'] / total_resources
+                short_ratio = metrics['resource_names']['short_names'] / total_resources
+
+                metrics['obfuscation_indicators']['high_obfuscated_ratio'] = obfuscated_ratio > 0.5
+                metrics['obfuscation_indicators']['short_name_dominance'] = short_ratio > 0.7
+                metrics['obfuscation_indicators']['sequential_naming'] = self._detect_sequential_names(resource_names)
+
+            total_strings = metrics['string_resources']['total_strings']
+            if total_strings > 0:
+                encrypted_ratio = metrics['string_resources']['encrypted_strings'] / total_strings
+                metrics['obfuscation_indicators']['encrypted_string_ratio'] = encrypted_ratio > 0.3
+
+            self.log(f"Resource analysis complete: {total_resources} resources, {total_strings} strings")
+            return metrics
+
+        except Exception as e:
+            if self.verbose:
+                print(f"Warning: Failed to analyze resources: {e}")
+            return None
+
+    def validate_apk_structure(self, apk_path):
+        """
+        Validate APK/AAR file structure and detect malformed headers
+
+        Checks:
+        - ZIP file integrity (signatures, CRC checksums)
+        - Required APK files (AndroidManifest.xml, classes.dex)
+        - DEX file headers (magic, checksums)
+        - Binary XML structure
+
+        Args:
+            apk_path: Path to APK or AAR file
+
+        Returns:
+            Dictionary with validation results and repair suggestions
+        """
+        self.log("Validating file structure...")
+
+        validation = {
+            'valid': True,
+            'issues': [],
+            'warnings': [],
+            'checks_performed': {
+                'zip_integrity': False,
+                'required_files': False,
+                'crc_validation': False,
+                'dex_headers': False,
+                'manifest_xml': False,
+            },
+            'repair_suggestions': [],
+            'file_type': None
+        }
+
+        # Determine file type
+        file_ext = os.path.splitext(apk_path)[1].lower()
+        validation['file_type'] = 'AAR' if file_ext == '.aar' else 'APK'
+
+        # 1. Basic ZIP structure validation
+        self.log("Checking ZIP integrity...")
+        try:
+            with zipfile.ZipFile(apk_path, 'r') as zf:
+                # Test ZIP integrity
+                bad_file = zf.testzip()
+                if bad_file:
+                    validation['issues'].append(f"Corrupted ZIP entry: {bad_file}")
+                    validation['valid'] = False
+                    validation['repair_suggestions'].append("Use 'zip -FF' to attempt repair of corrupted ZIP entries")
+
+                validation['checks_performed']['zip_integrity'] = True
+
+                # Get file list
+                files = zf.namelist()
+
+                # 2. Check required files
+                self.log("Checking required files...")
+                if validation['file_type'] == 'APK':
+                    if 'AndroidManifest.xml' not in files:
+                        validation['issues'].append("Missing AndroidManifest.xml - not a valid APK")
+                        validation['valid'] = False
+
+                    dex_files = [f for f in files if f.endswith('.dex')]
+                    if not dex_files:
+                        validation['issues'].append("No DEX files found - APK contains no executable code")
+                        validation['valid'] = False
+                    else:
+                        validation['warnings'].append(f"Found {len(dex_files)} DEX file(s)")
+
+                elif validation['file_type'] == 'AAR':
+                    if 'classes.jar' not in files:
+                        validation['warnings'].append("No classes.jar found - AAR may be resource-only")
+
+                validation['checks_performed']['required_files'] = True
+
+                # 3. Validate CRC checksums
+                self.log("Validating CRC checksums...")
+                crc_errors = []
+                for info in zf.infolist():
+                    if info.CRC != 0:  # Skip directories
+                        try:
+                            data = zf.read(info.filename)
+                            calculated_crc = zlib.crc32(data) & 0xffffffff
+                            if calculated_crc != info.CRC:
+                                crc_errors.append(info.filename)
+                        except Exception as e:
+                            validation['warnings'].append(f"Cannot read {info.filename}: {e}")
+
+                if crc_errors:
+                    validation['issues'].append(f"CRC checksum mismatch in {len(crc_errors)} file(s): {', '.join(crc_errors[:3])}{'...' if len(crc_errors) > 3 else ''}")
+                    validation['valid'] = False
+                    validation['repair_suggestions'].append("CRC errors indicate corruption - try: zip -FF input.apk --out repaired.apk")
+
+                validation['checks_performed']['crc_validation'] = True
+
+        except zipfile.BadZipFile as e:
+            validation['issues'].append(f"Invalid ZIP file structure: {e}")
+            validation['valid'] = False
+            validation['repair_suggestions'].extend([
+                "File is not a valid ZIP archive",
+                "Try: zip -FF input.apk --out repaired.apk",
+                "Or use: dex2jar or apktool to extract what's possible"
+            ])
+            return validation
+        except Exception as e:
+            validation['issues'].append(f"ZIP validation error: {e}")
+            validation['valid'] = False
+            return validation
+
+        # 4. DEX validation (if androguard available)
+        try:
+            from androguard.core.apk import APK as AndroAPK
+
+            self.log("Validating DEX headers and manifest...")
+
+            try:
+                apk = AndroAPK(apk_path)
+
+                # Validate AndroidManifest.xml
+                if validation['file_type'] == 'APK':
+                    try:
+                        manifest = apk.get_android_manifest_xml()
+                        if manifest:
+                            # Check for basic manifest structure
+                            manifest_elem = manifest.getElementsByTagName('manifest')
+                            if not manifest_elem:
+                                validation['warnings'].append("AndroidManifest.xml missing <manifest> root element")
+                            else:
+                                # Check for package name
+                                package = manifest_elem[0].getAttribute('android:package')
+                                if not package:
+                                    validation['warnings'].append("AndroidManifest.xml missing package name")
+                        else:
+                            validation['warnings'].append("Cannot parse AndroidManifest.xml")
+                    except Exception as e:
+                        validation['issues'].append(f"Malformed AndroidManifest.xml: {e}")
+                        validation['valid'] = False
+                        validation['repair_suggestions'].append("Manifest corruption may require manual XML reconstruction")
+
+                    validation['checks_performed']['manifest_xml'] = True
+
+                # Validate DEX files
+                dex_count = 0
+                dex_errors = []
+                for dex_data in apk.get_all_dex():
+                    dex_count += 1
+                    try:
+                        # Check DEX magic
+                        magic = dex_data[:8]
+                        if not magic.startswith(b'dex\n'):
+                            dex_errors.append(f"DEX {dex_count}: Invalid magic number")
+                        else:
+                            # Extract version
+                            version = magic[4:7].decode('ascii', errors='ignore')
+                            self.log(f"DEX {dex_count}: version {version}")
+
+                        # Check minimum DEX size
+                        if len(dex_data) < 112:  # Minimum DEX header size
+                            dex_errors.append(f"DEX {dex_count}: Too small ({len(dex_data)} bytes)")
+
+                    except Exception as e:
+                        dex_errors.append(f"DEX {dex_count}: {e}")
+
+                if dex_errors:
+                    validation['issues'].extend(dex_errors)
+                    validation['valid'] = False
+                    validation['repair_suggestions'].append("DEX corruption usually cannot be repaired - file may be intentionally malformed")
+
+                validation['checks_performed']['dex_headers'] = True
+
+            except Exception as e:
+                validation['issues'].append(f"APK parsing failed: {e}")
+                validation['valid'] = False
+                validation['repair_suggestions'].append("Use apktool or jadx to attempt extraction despite errors")
+
+        except ImportError:
+            validation['warnings'].append("androguard not available - DEX/manifest validation skipped")
+
+        # 5. Check for anti-analysis techniques
+        if validation['valid'] and validation['issues']:
+            validation['warnings'].append("File may use anti-analysis techniques (intentional malformation)")
+
+        # 6. Add general repair information
+        if not validation['valid'] and not validation['repair_suggestions']:
+            validation['repair_suggestions'].extend([
+                "Try ZIP repair: zip -FF input.apk --out output.apk",
+                "Alternative: 7zip may handle corrupted archives better",
+                "Extract with: unzip -qq input.apk (ignores some errors)"
+            ])
+
+        return validation
+
+    def analyze_cryptography(self, sources):
+        """
+        Analyze cryptographic operations, keys, parameters, and security practices
+
+        Detects:
+        - Cryptographic library usage (javax.crypto, java.security, Android Keystore)
+        - Hardcoded cryptographic keys (Base64, Hex, PEM format)
+        - Cryptographic parameters (IVs, salts, nonces)
+        - Weak/insecure algorithms (MD5, DES, SHA1, ECB mode)
+        - Cryptographic operations and their configurations
+        - Security vulnerabilities and best practices
+
+        Args:
+            sources: List of decompiled source file paths
+
+        Returns:
+            Dictionary with comprehensive cryptographic analysis
+        """
+        import re
+        import base64
+
+        crypto_analysis = {
+            'crypto_providers': {
+                # Modern/Recommended Providers
+                'jce': {'used': False, 'count': 0, 'classes': [], 'type': 'modern', 'description': 'Java Cryptography Extension (JCE)'},
+                'android_keystore': {'used': False, 'count': 0, 'classes': [], 'type': 'modern', 'description': 'Android Keystore (Secure Hardware-backed)'},
+                'conscrypt': {'used': False, 'count': 0, 'classes': [], 'type': 'modern', 'description': 'Conscrypt (Google OpenSSL wrapper)'},
+                'bouncycastle': {'used': False, 'count': 0, 'classes': [], 'type': 'modern', 'description': 'BouncyCastle (BC Provider)'},
+                'android_openssl': {'used': False, 'count': 0, 'classes': [], 'type': 'modern', 'description': 'Android OpenSSL'},
+
+                # Legacy/Deprecated Providers
+                'spongycastle': {'used': False, 'count': 0, 'classes': [], 'type': 'legacy', 'description': 'SpongyCastle (BC repackage - deprecated)'},
+                'sun_jce': {'used': False, 'count': 0, 'classes': [], 'type': 'legacy', 'description': 'SunJCE (Oracle JCE - Android incompatible)'},
+                'sun_security': {'used': False, 'count': 0, 'classes': [], 'type': 'legacy', 'description': 'Sun Security Provider (deprecated on Android)'},
+                'ibm_jce': {'used': False, 'count': 0, 'classes': [], 'type': 'legacy', 'description': 'IBM JCE Provider (legacy)'},
+                'cryptix': {'used': False, 'count': 0, 'classes': [], 'type': 'legacy', 'description': 'Cryptix (obsolete, unsupported)'},
+                'gnu_crypto': {'used': False, 'count': 0, 'classes': [], 'type': 'legacy', 'description': 'GNU Crypto (obsolete)'},
+                'jonelo': {'used': False, 'count': 0, 'classes': [], 'type': 'legacy', 'description': 'Jonelo Jacksum (legacy checksum library)'},
+
+                # Standard Java Security
+                'javax_crypto': {'used': False, 'count': 0, 'classes': [], 'type': 'standard', 'description': 'javax.crypto (JCA/JCE API)'},
+                'java_security': {'used': False, 'count': 0, 'classes': [], 'type': 'standard', 'description': 'java.security (JCA API)'},
+            },
+            'crypto_libraries': {
+                'javax_crypto': {'used': False, 'count': 0, 'classes': []},
+                'java_security': {'used': False, 'count': 0, 'classes': []},
+                'android_keystore': {'used': False, 'count': 0, 'classes': []},
+                'bouncycastle': {'used': False, 'count': 0, 'classes': []},
+                'conscrypt': {'used': False, 'count': 0, 'classes': []}
+            },
+            'cryptographic_keys': {
+                'hardcoded_keys': [],
+                'pem_keys': [],
+                'base64_keys': [],
+                'hex_keys': [],
+                'total_exposed_keys': 0
+            },
+            'crypto_parameters': {
+                'hardcoded_ivs': [],
+                'hardcoded_salts': [],
+                'hardcoded_nonces': [],
+                'algorithm_names': [],
+                'key_sizes': []
+            },
+            'crypto_operations': {
+                'cipher_instances': [],
+                'key_generators': [],
+                'message_digests': [],
+                'signatures': [],
+                'mac_operations': [],
+                'random_generators': []
+            },
+            'weak_crypto': {
+                'md5_usage': [],
+                'sha1_signature_usage': [],
+                'des_usage': [],
+                'ecb_mode_usage': [],
+                'static_iv_usage': [],
+                'weak_key_sizes': [],
+                'insecure_random': []
+            },
+            'security_issues': [],
+            'recommendations': [],
+            'total_crypto_operations': 0,
+            'security_score': 100  # Deduct points for issues
+        }
+
+        # Crypto API patterns
+        crypto_patterns = {
+            'cipher': r'Cipher\.getInstance\s*\(\s*["\']([^"\']+)["\']',
+            'key_generator': r'KeyGenerator\.getInstance\s*\(\s*["\']([^"\']+)["\']',
+            'secret_key_spec': r'new\s+SecretKeySpec\s*\(',
+            'message_digest': r'MessageDigest\.getInstance\s*\(\s*["\']([^"\']+)["\']',
+            'signature': r'Signature\.getInstance\s*\(\s*["\']([^"\']+)["\']',
+            'mac': r'Mac\.getInstance\s*\(\s*["\']([^"\']+)["\']',
+            'keystore': r'KeyStore\.getInstance\s*\(\s*["\']([^"\']+)["\']',
+            'secure_random': r'new\s+SecureRandom\s*\(',
+            'random': r'new\s+Random\s*\(',
+            'key_pair_generator': r'KeyPairGenerator\.getInstance\s*\(\s*["\']([^"\']+)["\']'
+        }
+
+        # Key patterns (Base64, Hex, PEM)
+        key_patterns = {
+            'pem_private': r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----[\s\S]+?-----END (RSA |EC |DSA )?PRIVATE KEY-----',
+            'pem_public': r'-----BEGIN PUBLIC KEY-----[\s\S]+?-----END PUBLIC KEY-----',
+            'pem_certificate': r'-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----',
+            'base64_key': r'[A-Za-z0-9+/]{40,}={0,2}',  # Long base64 strings (potential keys)
+            'hex_key': r'\b[0-9a-fA-F]{32,}\b',  # Long hex strings (potential keys)
+        }
+
+        # Weak algorithm patterns
+        weak_patterns = {
+            'md5': r'\bMD5\b',
+            'sha1_sig': r'SHA1[Ww]ith',
+            'des': r'\bDES\b(?!ede)',
+            'triple_des': r'\b(DESede|3DES)\b',
+            'ecb': r'/ECB/',
+            'rc4': r'\bRC4\b'
+        }
+
+        # Parameter patterns
+        param_patterns = {
+            'iv': r'(new\s+IvParameterSpec|initializationVector|"\s*iv\s*")',
+            'salt': r'(salt\s*=|SALT\s*=|byte\[\]\s+salt)',
+            'nonce': r'(nonce\s*=|NONCE\s*=)',
+        }
+
+        for source_file in sources:
+            try:
+                with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+
+                    # Skip empty files
+                    if not content.strip():
+                        continue
+
+                    file_name = os.path.basename(source_file)
+
+                    # Detect crypto providers (comprehensive detection)
+                    provider_patterns = {
+                        # Standard Java Crypto APIs
+                        'javax_crypto': [r'import javax\.crypto', r'javax\.crypto\.'],
+                        'java_security': [r'import java\.security', r'java\.security\.'],
+
+                        # JCE Detection (multiple indicators)
+                        'jce': [
+                            r'import javax\.crypto\.Cipher',
+                            r'JCEProvider',
+                            r'\.getInstance\s*\(\s*["\'][^"\']+["\']\s*,\s*["\']([^"\']+)["\']',  # getInstance with provider
+                            r'Security\.addProvider',
+                            r'Security\.getProvider'
+                        ],
+
+                        # Android Keystore
+                        'android_keystore': [
+                            r'AndroidKeyStore',
+                            r'KeyGenParameterSpec',
+                            r'KeyProtection',
+                            r'android\.security\.keystore',
+                            r'"AndroidKeyStore"'
+                        ],
+
+                        # Conscrypt (Google's OpenSSL wrapper)
+                        'conscrypt': [
+                            r'org\.conscrypt',
+                            r'Conscrypt\.newProvider',
+                            r'import com\.google\.android\.gms\.org\.conscrypt',
+                            r'"Conscrypt"'
+                        ],
+
+                        # BouncyCastle
+                        'bouncycastle': [
+                            r'org\.bouncycastle',
+                            r'import org\.bouncycastle\.jce',
+                            r'BouncyCastleProvider',
+                            r'"BC"',  # BC provider name
+                            r'new\s+BouncyCastleProvider'
+                        ],
+
+                        # Android OpenSSL
+                        'android_openssl': [
+                            r'org\.apache\.harmony\.xnet\.provider\.jsse\.OpenSSLProvider',
+                            r'OpenSSLProvider',
+                            r'AndroidOpenSSL',
+                            r'"AndroidOpenSSL"',
+                            r'org\.conscrypt\.OpenSSLProvider'  # Old package
+                        ],
+
+                        # SpongyCastle (deprecated BC repackage for Android)
+                        'spongycastle': [
+                            r'org\.spongycastle',
+                            r'SpongyCastleProvider',
+                            r'"SC"'  # SC provider name
+                        ],
+
+                        # SunJCE (Oracle JCE - not compatible with Android but sometimes found)
+                        'sun_jce': [
+                            r'com\.sun\.crypto',
+                            r'SunJCE',
+                            r'"SunJCE"',
+                            r'import sun\.security\.provider'
+                        ],
+
+                        # Sun Security Provider
+                        'sun_security': [
+                            r'sun\.security\.provider\.Sun',
+                            r'"SUN"',  # SUN provider name
+                            r'import sun\.security'
+                        ],
+
+                        # IBM JCE
+                        'ibm_jce': [
+                            r'com\.ibm\.crypto',
+                            r'IBMJCE',
+                            r'"IBMJCE"',
+                            r'com\.ibm\.jsse'
+                        ],
+
+                        # Cryptix (obsolete)
+                        'cryptix': [
+                            r'cryptix\.provider',
+                            r'CryptixCrypto',
+                            r'"CryptixCrypto"'
+                        ],
+
+                        # GNU Crypto (obsolete)
+                        'gnu_crypto': [
+                            r'gnu\.crypto',
+                            r'GnuCrypto',
+                            r'"GNU-CRYPTO"'
+                        ],
+
+                        # Jonelo Jacksum (legacy checksum library)
+                        'jonelo': [
+                            r'jonelo\.jacksum',
+                            r'import jonelo'
+                        ]
+                    }
+
+                    # Detect all providers
+                    for provider_name, patterns in provider_patterns.items():
+                        for pattern in patterns:
+                            if re.search(pattern, content):
+                                crypto_analysis['crypto_providers'][provider_name]['used'] = True
+                                crypto_analysis['crypto_providers'][provider_name]['count'] += 1
+                                if file_name not in crypto_analysis['crypto_providers'][provider_name]['classes']:
+                                    crypto_analysis['crypto_providers'][provider_name]['classes'].append(file_name)
+                                break  # Found this provider, move to next
+
+                    # Legacy crypto_libraries for backward compatibility
+                    if 'import javax.crypto' in content or 'javax.crypto.' in content:
+                        crypto_analysis['crypto_libraries']['javax_crypto']['used'] = True
+                        crypto_analysis['crypto_libraries']['javax_crypto']['count'] += 1
+                        crypto_analysis['crypto_libraries']['javax_crypto']['classes'].append(file_name)
+
+                    if 'import java.security' in content or 'java.security.' in content:
+                        crypto_analysis['crypto_libraries']['java_security']['used'] = True
+                        crypto_analysis['crypto_libraries']['java_security']['count'] += 1
+                        crypto_analysis['crypto_libraries']['java_security']['classes'].append(file_name)
+
+                    if 'AndroidKeyStore' in content or 'KeyGenParameterSpec' in content:
+                        crypto_analysis['crypto_libraries']['android_keystore']['used'] = True
+                        crypto_analysis['crypto_libraries']['android_keystore']['count'] += 1
+                        crypto_analysis['crypto_libraries']['android_keystore']['classes'].append(file_name)
+
+                    if 'org.bouncycastle' in content:
+                        crypto_analysis['crypto_libraries']['bouncycastle']['used'] = True
+                        crypto_analysis['crypto_libraries']['bouncycastle']['count'] += 1
+                        crypto_analysis['crypto_libraries']['bouncycastle']['classes'].append(file_name)
+
+                    if 'org.conscrypt' in content:
+                        crypto_analysis['crypto_libraries']['conscrypt']['used'] = True
+                        crypto_analysis['crypto_libraries']['conscrypt']['count'] += 1
+                        crypto_analysis['crypto_libraries']['conscrypt']['classes'].append(file_name)
+
+                    # Detect crypto operations
+                    for op_name, pattern in crypto_patterns.items():
+                        matches = re.finditer(pattern, content)
+                        for match in matches:
+                            algorithm = match.group(1) if match.groups() else 'unknown'
+                            operation_entry = {
+                                'file': file_name,
+                                'operation': op_name,
+                                'algorithm': algorithm,
+                                'line_snippet': match.group(0)[:100]
+                            }
+
+                            if op_name == 'cipher':
+                                crypto_analysis['crypto_operations']['cipher_instances'].append(operation_entry)
+                            elif op_name in ['key_generator', 'key_pair_generator']:
+                                crypto_analysis['crypto_operations']['key_generators'].append(operation_entry)
+                            elif op_name == 'message_digest':
+                                crypto_analysis['crypto_operations']['message_digests'].append(operation_entry)
+                            elif op_name == 'signature':
+                                crypto_analysis['crypto_operations']['signatures'].append(operation_entry)
+                            elif op_name == 'mac':
+                                crypto_analysis['crypto_operations']['mac_operations'].append(operation_entry)
+                            elif op_name in ['secure_random', 'random']:
+                                crypto_analysis['crypto_operations']['random_generators'].append(operation_entry)
+
+                            crypto_analysis['total_crypto_operations'] += 1
+
+                    # Detect SecretKeySpec (often indicates hardcoded keys)
+                    if re.search(crypto_patterns['secret_key_spec'], content):
+                        # Look for byte array initialization near SecretKeySpec
+                        key_spec_context = re.findall(
+                            r'(new\s+SecretKeySpec\s*\([^)]{0,200}\))',
+                            content,
+                            re.DOTALL
+                        )
+                        for context in key_spec_context:
+                            # Check if key bytes are hardcoded
+                            if 'byte[]' in context or '{' in context:
+                                crypto_analysis['cryptographic_keys']['hardcoded_keys'].append({
+                                    'file': file_name,
+                                    'type': 'SecretKeySpec',
+                                    'context': context[:200],
+                                    'severity': 'CRITICAL'
+                                })
+                                crypto_analysis['cryptographic_keys']['total_exposed_keys'] += 1
+
+                    # Detect PEM-formatted keys
+                    for key_type, pattern in key_patterns.items():
+                        if 'pem' in key_type:
+                            matches = re.finditer(pattern, content)
+                            for match in matches:
+                                crypto_analysis['cryptographic_keys']['pem_keys'].append({
+                                    'file': file_name,
+                                    'type': key_type,
+                                    'key_preview': match.group(0)[:100] + '...',
+                                    'severity': 'CRITICAL'
+                                })
+                                crypto_analysis['cryptographic_keys']['total_exposed_keys'] += 1
+
+                    # Detect Base64-encoded potential keys (long base64 strings)
+                    base64_matches = re.finditer(key_patterns['base64_key'], content)
+                    for match in base64_matches:
+                        b64_string = match.group(0)
+                        # Filter: must be 40+ chars, likely a key size (128/192/256 bits)
+                        if len(b64_string) >= 40:
+                            # Try to decode to check validity
+                            try:
+                                decoded = base64.b64decode(b64_string, validate=True)
+                                decoded_len = len(decoded)
+                                # Check if decoded length matches common key sizes
+                                if decoded_len in [16, 24, 32, 64, 128, 256]:  # Common key sizes in bytes
+                                    crypto_analysis['cryptographic_keys']['base64_keys'].append({
+                                        'file': file_name,
+                                        'base64_string': b64_string[:50] + '...',
+                                        'decoded_length': decoded_len,
+                                        'possible_key_size': decoded_len * 8,  # bits
+                                        'severity': 'HIGH'
+                                    })
+                                    crypto_analysis['cryptographic_keys']['total_exposed_keys'] += 1
+                            except:
+                                pass  # Not valid base64
+
+                    # Detect hex-encoded potential keys
+                    hex_matches = re.finditer(key_patterns['hex_key'], content)
+                    for match in hex_matches:
+                        hex_string = match.group(0)
+                        hex_len = len(hex_string)
+                        # Check if length matches common key sizes
+                        if hex_len in [32, 48, 64, 128, 256, 512]:  # Hex chars for 128/192/256/512/1024/2048 bits
+                            crypto_analysis['cryptographic_keys']['hex_keys'].append({
+                                'file': file_name,
+                                'hex_string': hex_string[:50] + '...',
+                                'hex_length': hex_len,
+                                'possible_key_size': hex_len * 4,  # bits
+                                'severity': 'HIGH'
+                            })
+                            crypto_analysis['cryptographic_keys']['total_exposed_keys'] += 1
+
+                    # Detect weak crypto usage
+                    for weak_type, pattern in weak_patterns.items():
+                        matches = re.finditer(pattern, content)
+                        for match in matches:
+                            weak_entry = {
+                                'file': file_name,
+                                'algorithm': weak_type,
+                                'context': match.group(0),
+                                'severity': 'CRITICAL' if weak_type in ['md5', 'des', 'rc4'] else 'HIGH'
+                            }
+
+                            if weak_type == 'md5':
+                                crypto_analysis['weak_crypto']['md5_usage'].append(weak_entry)
+                            elif weak_type == 'sha1_sig':
+                                crypto_analysis['weak_crypto']['sha1_signature_usage'].append(weak_entry)
+                            elif weak_type in ['des', 'triple_des']:
+                                crypto_analysis['weak_crypto']['des_usage'].append(weak_entry)
+                            elif weak_type == 'ecb':
+                                crypto_analysis['weak_crypto']['ecb_mode_usage'].append(weak_entry)
+
+                    # Detect insecure Random (should use SecureRandom)
+                    if re.search(r'new\s+Random\s*\(', content) and 'crypto' in content.lower():
+                        crypto_analysis['weak_crypto']['insecure_random'].append({
+                            'file': file_name,
+                            'issue': 'Using Random instead of SecureRandom for cryptographic operations',
+                            'severity': 'HIGH'
+                        })
+
+                    # Detect hardcoded IVs/salts/nonces
+                    for param_type, pattern in param_patterns.items():
+                        if re.search(pattern, content):
+                            # Look for hardcoded byte arrays near these patterns
+                            context_match = re.search(
+                                pattern + r'.{0,100}(new\s+byte\[\]|\{)',
+                                content,
+                                re.DOTALL
+                            )
+                            if context_match:
+                                param_entry = {
+                                    'file': file_name,
+                                    'parameter_type': param_type,
+                                    'context': context_match.group(0)[:150],
+                                    'severity': 'HIGH' if param_type == 'iv' else 'MEDIUM'
+                                }
+
+                                if param_type == 'iv':
+                                    crypto_analysis['crypto_parameters']['hardcoded_ivs'].append(param_entry)
+                                elif param_type == 'salt':
+                                    crypto_analysis['crypto_parameters']['hardcoded_salts'].append(param_entry)
+                                elif param_type == 'nonce':
+                                    crypto_analysis['crypto_parameters']['hardcoded_nonces'].append(param_entry)
+
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: Failed to analyze crypto in {source_file}: {e}")
+                continue
+
+        # Generate security issues and recommendations
+        self._assess_crypto_security(crypto_analysis)
+
+        return crypto_analysis
+
+    def _assess_crypto_security(self, crypto_analysis):
+        """
+        Assess cryptographic security and generate issues/recommendations
+
+        Args:
+            crypto_analysis: Cryptographic analysis dictionary (modified in place)
+        """
+        issues = []
+        recommendations = []
+        score = 100
+
+        # Check for hardcoded keys
+        total_keys = crypto_analysis['cryptographic_keys']['total_exposed_keys']
+        if total_keys > 0:
+            issues.append({
+                'severity': 'CRITICAL',
+                'category': 'Hardcoded Keys',
+                'description': f'Found {total_keys} hardcoded cryptographic keys in source code',
+                'impact': 'Attackers can extract keys and decrypt data or forge signatures',
+                'cwe': 'CWE-321: Use of Hard-coded Cryptographic Key'
+            })
+            score -= min(50, total_keys * 10)  # Severe penalty
+            recommendations.append('Never hardcode cryptographic keys - use Android Keystore or secure key derivation')
+
+        # Check for weak algorithms
+        if crypto_analysis['weak_crypto']['md5_usage']:
+            issues.append({
+                'severity': 'CRITICAL',
+                'category': 'Weak Hashing',
+                'description': f'MD5 algorithm detected ({len(crypto_analysis["weak_crypto"]["md5_usage"])} instances)',
+                'impact': 'MD5 is cryptographically broken and vulnerable to collisions',
+                'cwe': 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+            })
+            score -= 15
+            recommendations.append('Replace MD5 with SHA-256 or SHA-3 for hashing')
+
+        if crypto_analysis['weak_crypto']['des_usage']:
+            issues.append({
+                'severity': 'CRITICAL',
+                'category': 'Weak Encryption',
+                'description': f'DES/3DES algorithm detected ({len(crypto_analysis["weak_crypto"]["des_usage"])} instances)',
+                'impact': 'DES has a 56-bit key size and is vulnerable to brute force attacks',
+                'cwe': 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+            })
+            score -= 20
+            recommendations.append('Replace DES/3DES with AES-256-GCM')
+
+        if crypto_analysis['weak_crypto']['sha1_signature_usage']:
+            issues.append({
+                'severity': 'HIGH',
+                'category': 'Weak Signature',
+                'description': f'SHA1 signature algorithm detected ({len(crypto_analysis["weak_crypto"]["sha1_signature_usage"])} instances)',
+                'impact': 'SHA1 is deprecated for digital signatures due to collision vulnerabilities',
+                'cwe': 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+            })
+            score -= 10
+            recommendations.append('Use SHA256withRSA or SHA256withECDSA for signatures')
+
+        if crypto_analysis['weak_crypto']['ecb_mode_usage']:
+            issues.append({
+                'severity': 'HIGH',
+                'category': 'Insecure Mode',
+                'description': f'ECB cipher mode detected ({len(crypto_analysis["weak_crypto"]["ecb_mode_usage"])} instances)',
+                'impact': 'ECB mode does not provide semantic security - identical plaintexts produce identical ciphertexts',
+                'cwe': 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+            })
+            score -= 15
+            recommendations.append('Use GCM or CBC mode with proper IV - never use ECB')
+
+        # Check for hardcoded IVs
+        if crypto_analysis['crypto_parameters']['hardcoded_ivs']:
+            issues.append({
+                'severity': 'HIGH',
+                'category': 'Static IV',
+                'description': f'Hardcoded initialization vectors detected ({len(crypto_analysis["crypto_parameters"]["hardcoded_ivs"])} instances)',
+                'impact': 'Static IVs break semantic security and enable pattern analysis attacks',
+                'cwe': 'CWE-329: Not Using a Random IV with CBC Mode'
+            })
+            score -= 15
+            recommendations.append('Generate random IVs using SecureRandom for each encryption operation')
+
+        # Check for insecure Random
+        if crypto_analysis['weak_crypto']['insecure_random']:
+            issues.append({
+                'severity': 'HIGH',
+                'category': 'Weak RNG',
+                'description': f'Using java.util.Random instead of SecureRandom ({len(crypto_analysis["weak_crypto"]["insecure_random"])} instances)',
+                'impact': 'Random is predictable and unsuitable for cryptographic operations',
+                'cwe': 'CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator'
+            })
+            score -= 10
+            recommendations.append('Use SecureRandom for all cryptographic random number generation')
+
+        # Check for proper key storage
+        if crypto_analysis['crypto_libraries']['android_keystore']['used']:
+            recommendations.append('✓ Good: Using Android Keystore for secure key storage')
+        elif crypto_analysis['total_crypto_operations'] > 0:
+            issues.append({
+                'severity': 'MEDIUM',
+                'category': 'Key Storage',
+                'description': 'Cryptographic operations detected but no Android Keystore usage found',
+                'impact': 'Keys may be stored insecurely in SharedPreferences or files',
+                'cwe': 'CWE-311: Missing Encryption of Sensitive Data'
+            })
+            score -= 10
+            recommendations.append('Use Android Keystore to securely store cryptographic keys')
+
+        # Check crypto providers for legacy/deprecated usage
+        providers = crypto_analysis.get('crypto_providers', {})
+
+        # Warn about legacy providers
+        legacy_providers_found = []
+        for provider_name, provider_data in providers.items():
+            if provider_data.get('used') and provider_data.get('type') == 'legacy':
+                legacy_providers_found.append((provider_name, provider_data['description']))
+
+        if legacy_providers_found:
+            legacy_names = ', '.join([f"{name}" for name, desc in legacy_providers_found])
+            issues.append({
+                'severity': 'MEDIUM',
+                'category': 'Legacy Crypto Provider',
+                'description': f'Using legacy/deprecated cryptographic providers: {legacy_names}',
+                'impact': 'Legacy providers may have security vulnerabilities and compatibility issues on modern Android',
+                'cwe': 'CWE-327: Use of a Broken or Risky Cryptographic Algorithm'
+            })
+            score -= 5 * len(legacy_providers_found)
+
+            # Specific recommendations for legacy providers
+            if any('spongycastle' in name for name, _ in legacy_providers_found):
+                recommendations.append('Replace SpongyCastle with modern BouncyCastle')
+            if any('sun_jce' in name or 'sun_security' in name for name, _ in legacy_providers_found):
+                recommendations.append('Replace Sun providers with Android-compatible providers (Conscrypt, BouncyCastle)')
+            if any('cryptix' in name or 'gnu_crypto' in name for name, _ in legacy_providers_found):
+                recommendations.append('Replace obsolete crypto libraries with modern alternatives')
+
+        # Positive indicators for modern providers
+        if providers.get('android_keystore', {}).get('used'):
+            recommendations.append('✓ Good: Using Android Keystore for hardware-backed key storage')
+        if providers.get('conscrypt', {}).get('used'):
+            recommendations.append('✓ Good: Using Conscrypt (Google\'s OpenSSL wrapper)')
+        if providers.get('bouncycastle', {}).get('used'):
+            recommendations.append('✓ Good: Using BouncyCastle crypto provider')
+        if providers.get('jce', {}).get('used'):
+            recommendations.append('✓ Using JCE (Java Cryptography Extension)')
+
+        # Positive indicators (legacy check)
+        if crypto_analysis['crypto_libraries']['javax_crypto']['used']:
+            recommendations.append('✓ Using standard javax.crypto library')
+
+        # Check for egregious cryptography issues and recommend WBC
+        egregious_issues = []
+
+        # Count critical crypto issues
+        has_hardcoded_keys = total_keys > 0
+        has_weak_encryption = len(crypto_analysis['weak_crypto'].get('des_usage', [])) > 0
+        has_weak_hash = len(crypto_analysis['weak_crypto'].get('md5_usage', [])) > 0
+        has_ecb_mode = len(crypto_analysis['weak_crypto'].get('ecb_mode_usage', [])) > 0
+        has_static_iv = len(crypto_analysis['crypto_parameters'].get('hardcoded_ivs', [])) > 0
+
+        if has_hardcoded_keys:
+            egregious_issues.append('hardcoded keys')
+        if has_weak_encryption:
+            egregious_issues.append('weak encryption (DES/3DES)')
+        if has_weak_hash:
+            egregious_issues.append('broken hashing (MD5)')
+        if has_ecb_mode:
+            egregious_issues.append('insecure cipher mode (ECB)')
+        if has_static_iv:
+            egregious_issues.append('static initialization vectors')
+
+        # Recommend WBC if multiple egregious issues detected
+        if len(egregious_issues) >= 2 or has_hardcoded_keys:
+            recommendations.append('')  # Blank line for separation
+            recommendations.append('⚠️  EGREGIOUS CRYPTOGRAPHY DETECTED - Consider White-Box Cryptography (WBC) Solutions:')
+
+            if has_hardcoded_keys:
+                recommendations.append('• For hardcoded keys: WBC can hide key material in transformed cipher implementations')
+
+            recommendations.append('• White-Box Cryptography providers for mobile:')
+            recommendations.append('  - Irdeto White-Box (Commercial): Enterprise-grade WBC with key hiding and anti-tampering')
+            recommendations.append('  - Arxan Application Protection (Commercial): WBC + code protection + runtime integrity')
+            recommendations.append('  - Gemalto Sentinel (Commercial): WBC with licensing and DRM integration')
+            recommendations.append('  - Inside Secure (Verimatrix) WBC (Commercial): Optimized for mobile performance')
+
+            if has_weak_encryption or has_ecb_mode or has_static_iv:
+                recommendations.append('• WBC protects cryptographic operations even when algorithms are exposed')
+                recommendations.append('• Note: WBC is NOT a replacement for fixing broken crypto - fix weak algorithms first!')
+
+            recommendations.append('• Combine WBC with: obfuscation, anti-debugging, integrity checks, and secure key storage')
+            recommendations.append('• WBC increases reverse engineering cost but does not eliminate all crypto extraction risks')
+
+        # Sort issues by severity
+        severity_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3}
+        issues.sort(key=lambda x: severity_order.get(x['severity'], 999))
+
+        crypto_analysis['security_issues'] = issues
+        crypto_analysis['recommendations'] = recommendations
+        crypto_analysis['security_score'] = max(0, score)
+        crypto_analysis['egregious_crypto_detected'] = len(egregious_issues) >= 2 or has_hardcoded_keys
+        crypto_analysis['egregious_issues'] = egregious_issues
+
     def _check_release_readiness(self, analysis, expected_obfuscator=None, min_score=40):
         """
         Check if APK/AAR is ready for release based on obfuscation
@@ -1378,12 +2365,19 @@ class APKAnalyzer:
         strings = analysis['strings']
         patterns = analysis['patterns']
         cf = analysis['control_flow']
+        resources = analysis.get('resources')  # Optional - may be None
 
         # Score from 0-100 based on obfuscation indicators
+        # Scoring breakdown:
+        # - Identifiers: 35 points
+        # - Strings: 25 points
+        # - Patterns: 20 points
+        # - Control Flow: 10 points
+        # - Resources: 10 points (if available)
         score = 0
         indicators = []
 
-        # Identifier analysis (40 points)
+        # Identifier analysis (35 points)
         if ident['total_classes'] > 0:
             single_char_pct = ident.get('single_char_class_percentage', 0)
             meaningful_pct = ident.get('meaningful_class_percentage', 0)
@@ -1391,21 +2385,21 @@ class APKAnalyzer:
 
             # High single-char percentage = likely obfuscated
             if single_char_pct > 50:
-                score += 20
+                score += 17
                 indicators.append(f"Very high single-character class names ({single_char_pct:.1f}%)")
             elif single_char_pct > 30:
-                score += 15
+                score += 13
                 indicators.append(f"High single-character class names ({single_char_pct:.1f}%)")
             elif single_char_pct > 10:
-                score += 10
+                score += 9
                 indicators.append(f"Moderate single-character class names ({single_char_pct:.1f}%)")
 
             # Low meaningful percentage = likely obfuscated
             if meaningful_pct < 20:
-                score += 15
+                score += 13
                 indicators.append(f"Very low meaningful class names ({meaningful_pct:.1f}%)")
             elif meaningful_pct < 40:
-                score += 10
+                score += 9
                 indicators.append(f"Low meaningful class names ({meaningful_pct:.1f}%)")
 
             # Short average length = likely obfuscated
@@ -1416,19 +2410,19 @@ class APKAnalyzer:
                 score += 3
                 indicators.append(f"Short average class name length ({avg_length:.1f})")
 
-        # String analysis (30 points)
+        # String analysis (25 points)
         if strings['total_strings'] > 0:
             encrypted_pct = strings.get('encrypted_string_percentage', 0)
 
             if encrypted_pct > 30:
-                score += 20
+                score += 17
                 indicators.append(f"High encrypted string percentage ({encrypted_pct:.1f}%)")
             elif encrypted_pct > 10:
-                score += 10
+                score += 8
                 indicators.append(f"Moderate encrypted string percentage ({encrypted_pct:.1f}%)")
 
             if strings.get('decryption_methods', 0) > 0:
-                score += 10
+                score += 8
                 indicators.append(f"Decryption methods detected ({strings['decryption_methods']} found)")
 
         # Obfuscation patterns (20 points)
@@ -1455,6 +2449,41 @@ class APKAnalyzer:
         if cf.get('goto_statements', 0) > 0:
             score += 5
             indicators.append(f"Goto statements detected ({cf['goto_statements']} found)")
+
+        # Resource obfuscation (10 points) - only if resources were analyzed
+        if resources:
+            res_names = resources.get('resource_names', {})
+            total_resources = res_names.get('total_resources', 0)
+
+            if total_resources > 0:
+                obfuscated_ratio = res_names.get('obfuscated_names', 0) / total_resources
+                short_ratio = res_names.get('short_names', 0) / total_resources
+
+                if obfuscated_ratio > 0.5:
+                    score += 5
+                    indicators.append(f"High resource name obfuscation ({obfuscated_ratio*100:.1f}%)")
+                elif obfuscated_ratio > 0.3:
+                    score += 3
+                    indicators.append(f"Moderate resource name obfuscation ({obfuscated_ratio*100:.1f}%)")
+
+                if short_ratio > 0.7:
+                    score += 3
+                    indicators.append(f"High short resource names ({short_ratio*100:.1f}%)")
+                elif short_ratio > 0.5:
+                    score += 2
+                    indicators.append(f"Moderate short resource names ({short_ratio*100:.1f}%)")
+
+            # String resource encryption
+            res_strings = resources.get('string_resources', {})
+            total_strings = res_strings.get('total_strings', 0)
+            if total_strings > 0:
+                encrypted_ratio = res_strings.get('encrypted_strings', 0) / total_strings
+                if encrypted_ratio > 0.3:
+                    score += 5
+                    indicators.append(f"High string resource encryption ({encrypted_ratio*100:.1f}%)")
+                elif encrypted_ratio > 0.1:
+                    score += 3
+                    indicators.append(f"Moderate string resource encryption ({encrypted_ratio*100:.1f}%)")
 
         # Cap score at 100
         score = min(score, 100)
@@ -1511,6 +2540,28 @@ class APKAnalyzer:
             'signature': self._extract_signature_info(file_path)
         }
 
+        # Validate file structure
+        print("Validating file structure...")
+        validation = self.validate_apk_structure(file_path)
+        file_metadata['validation'] = validation
+
+        # Display validation results
+        if validation['valid']:
+            print("✓ File structure is valid")
+        else:
+            print(f"\n⚠️  File structure issues detected:")
+            for issue in validation['issues']:
+                print(f"  • {issue}")
+            if validation['warnings']:
+                print("\n  Warnings:")
+                for warning in validation['warnings']:
+                    print(f"  • {warning}")
+            if validation['repair_suggestions']:
+                print("\n  Repair suggestions:")
+                for suggestion in validation['repair_suggestions']:
+                    print(f"  • {suggestion}")
+            print()
+
         # Create temp directory for decompilation
         with tempfile.TemporaryDirectory() as temp_dir:
             file_dir = os.path.join(temp_dir, "analysis")
@@ -1526,12 +2577,26 @@ class APKAnalyzer:
                 'packages': self.analyze_package_structure(sources),
                 'patterns': self.detect_obfuscation_patterns(sources),
                 'strings': self.analyze_strings(sources),
-                'control_flow': self.analyze_control_flow(sources)
+                'control_flow': self.analyze_control_flow(sources),
+                'resources': self.analyze_resources(file_path),  # Optional, returns None if androguard unavailable
+                'cryptography': self.analyze_cryptography(sources)  # Crypto analysis
             }
 
             # Assess obfuscation likelihood
             print("\nAssessing obfuscation likelihood...")
             obfuscation_assessment = self._assess_obfuscation_likelihood(analysis)
+
+            # Display crypto security summary
+            crypto = analysis.get('cryptography', {})
+            if crypto and crypto.get('total_crypto_operations', 0) > 0:
+                print(f"\nCryptographic Operations Detected: {crypto['total_crypto_operations']}")
+                if crypto['security_issues']:
+                    print(f"⚠️  Security Issues Found: {len(crypto['security_issues'])}")
+                    for issue in crypto['security_issues'][:3]:  # Show top 3
+                        print(f"  • [{issue['severity']}] {issue['description']}")
+                if crypto['cryptographic_keys']['total_exposed_keys'] > 0:
+                    print(f"🔑 Hardcoded Keys Detected: {crypto['cryptographic_keys']['total_exposed_keys']} (CRITICAL RISK)")
+                print(f"Crypto Security Score: {crypto['security_score']}/100")
 
             # Check release readiness
             print("Checking release readiness...")
@@ -1667,6 +2732,41 @@ class APKAnalyzer:
             {blockers_html}
             {warnings_html}
             {recommendations_html}
+        </div>
+
+        <div style="background-color: #e3f2fd; border-left: 4px solid #2196f3; padding: 20px; margin: 20px 0; border-radius: 4px;">
+            <h3 style="color: #1565c0; margin-top: 0;">ℹ️ Understanding Obfuscation</h3>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <strong>Obfuscation is a resilience mechanism</strong> that increases the cost and difficulty of reverse engineering.
+            </p>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <strong>What obfuscation DOES protect:</strong>
+            </p>
+            <ul style="color: #1565c0;">
+                <li><strong>Confidentiality of Code Logic:</strong> Makes it harder to understand how your algorithms and business logic work</li>
+                <li><strong>Intellectual Property:</strong> Protects proprietary algorithms and implementation details from competitors</li>
+                <li><strong>Raises Reverse Engineering Cost:</strong> Forces attackers to spend more time and effort analyzing your code</li>
+            </ul>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <strong>What obfuscation does NOT provide:</strong>
+            </p>
+            <ul style="color: #1565c0;">
+                <li><strong>NOT Anti-Tamper:</strong> Does not prevent code modification, repackaging, or injection attacks</li>
+                <li><strong>NOT Integrity Checking:</strong> Does not detect if your code has been modified or tampered with</li>
+                <li><strong>NOT Secret Protection:</strong> Cannot protect hardcoded API keys, passwords, or cryptographic keys (these can still be extracted)</li>
+                <li><strong>NOT Runtime Protection:</strong> Does not prevent debugging, hooking, or dynamic analysis at runtime</li>
+            </ul>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <strong>For comprehensive protection, combine obfuscation with:</strong>
+            </p>
+            <ul style="color: #1565c0;">
+                <li><strong>Integrity Protection:</strong> Code signing, certificate pinning, runtime integrity checks, anti-tamper mechanisms</li>
+                <li><strong>Secret Management:</strong> Never hardcode secrets; use Android Keystore, server-side validation, secure enclaves</li>
+                <li><strong>Runtime Protection:</strong> RASP, root/jailbreak detection, anti-debugging, SSL pinning</li>
+            </ul>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <em>Obfuscation is one important layer in a defense-in-depth security strategy, not a complete solution.</em>
+            </p>
         </div>
 """
 
@@ -1853,6 +2953,8 @@ class APKAnalyzer:
         <h2>Sensitive Strings Analysis</h2>
         {self._format_sensitive_strings_html(sensitive_strings)}
 
+        {self._format_cryptography_html(analysis.get('cryptography', {}))}
+
         <h2>Identifier Analysis</h2>
         {self._format_metrics(analysis['identifiers'])}
 
@@ -1864,6 +2966,8 @@ class APKAnalyzer:
 
         <h2>Package Structure</h2>
         {self._format_metrics(analysis['packages'])}
+
+        {self._format_single_resources_html(analysis.get('resources'))}
 
         <h2>Obfuscation Patterns</h2>
         {self._format_metrics(analysis['patterns'])}
@@ -1955,6 +3059,27 @@ class APKAnalyzer:
             for i, indicator in enumerate(assessment['indicators'], 1):
                 print(f"  {i}. {indicator}")
 
+        # Educational security notice
+        print(f"\n{'='*60}")
+        print("ℹ️  UNDERSTANDING OBFUSCATION")
+        print(f"{'='*60}\n")
+        print("Obfuscation is a RESILIENCE MECHANISM that increases the cost")
+        print("and difficulty of reverse engineering.\n")
+        print("What obfuscation DOES protect:")
+        print("  ✓ Confidentiality of Code Logic: Makes algorithms & business logic harder to understand")
+        print("  ✓ Intellectual Property: Protects proprietary implementation details")
+        print("  ✓ Raises Reverse Engineering Cost: Forces attackers to spend more time & effort\n")
+        print("What obfuscation does NOT provide:")
+        print("  ✗ NOT Anti-Tamper: Does not prevent code modification or repackaging")
+        print("  ✗ NOT Integrity Checking: Does not detect if code has been tampered with")
+        print("  ✗ NOT Secret Protection: Cannot protect hardcoded keys/passwords (still extractable)")
+        print("  ✗ NOT Runtime Protection: Does not prevent debugging or dynamic analysis\n")
+        print("For comprehensive protection, combine obfuscation with:")
+        print("  • Integrity: Code signing, certificate pinning, runtime integrity checks, anti-tamper")
+        print("  • Secrets: Never hardcode; use Android Keystore, server-side validation")
+        print("  • Runtime: RASP, root detection, anti-debugging, SSL pinning\n")
+        print("Obfuscation is one important layer in defense-in-depth, not a complete solution.")
+
         print(f"\n{'='*60}\n")
 
     def compare_apks(self, original_apk, obfuscated_apk=None, output_dir="./results", expected_obfuscator=None, min_score=40):
@@ -1999,6 +3124,36 @@ class APKAnalyzer:
             'signature': self._extract_signature_info(obfuscated_apk)
         }
 
+        # Validate file structures
+        print("Validating file structures...")
+        original_validation = self.validate_apk_structure(original_apk)
+        obfuscated_validation = self.validate_apk_structure(obfuscated_apk)
+
+        original_metadata['validation'] = original_validation
+        obfuscated_metadata['validation'] = obfuscated_validation
+
+        # Display validation results
+        print("Original file:")
+        if original_validation['valid']:
+            print("  ✓ File structure is valid")
+        else:
+            print(f"  ⚠️  File structure issues detected:")
+            for issue in original_validation['issues']:
+                print(f"    • {issue}")
+
+        print("Obfuscated file:")
+        if obfuscated_validation['valid']:
+            print("  ✓ File structure is valid")
+        else:
+            print(f"  ⚠️  File structure issues detected:")
+            for issue in obfuscated_validation['issues']:
+                print(f"    • {issue}")
+            if obfuscated_validation['repair_suggestions']:
+                print("\n  Repair suggestions:")
+                for suggestion in obfuscated_validation['repair_suggestions']:
+                    print(f"    • {suggestion}")
+        print()
+
         # Create temp directories for decompilation
         with tempfile.TemporaryDirectory() as temp_dir:
             original_dir = os.path.join(temp_dir, "original")
@@ -2016,7 +3171,9 @@ class APKAnalyzer:
                 'packages': self.analyze_package_structure(original_sources),
                 'patterns': self.detect_obfuscation_patterns(original_sources),
                 'strings': self.analyze_strings(original_sources),
-                'control_flow': self.analyze_control_flow(original_sources)
+                'control_flow': self.analyze_control_flow(original_sources),
+                'resources': self.analyze_resources(original_apk),  # Optional
+                'cryptography': self.analyze_cryptography(original_sources)  # Crypto analysis
             }
 
             print("Analyzing obfuscated file...")
@@ -2025,8 +3182,29 @@ class APKAnalyzer:
                 'packages': self.analyze_package_structure(obfuscated_sources),
                 'patterns': self.detect_obfuscation_patterns(obfuscated_sources),
                 'strings': self.analyze_strings(obfuscated_sources),
-                'control_flow': self.analyze_control_flow(obfuscated_sources)
+                'control_flow': self.analyze_control_flow(obfuscated_sources),
+                'resources': self.analyze_resources(obfuscated_apk),  # Optional
+                'cryptography': self.analyze_cryptography(obfuscated_sources)  # Crypto analysis
             }
+
+            # Display crypto security comparison
+            orig_crypto = original_analysis.get('cryptography', {})
+            obf_crypto = obfuscated_analysis.get('cryptography', {})
+            if orig_crypto.get('total_crypto_operations', 0) > 0 or obf_crypto.get('total_crypto_operations', 0) > 0:
+                print("\n" + "="*60)
+                print("Cryptographic Security Analysis")
+                print("="*60)
+                print(f"Original - Crypto Ops: {orig_crypto.get('total_crypto_operations', 0)}, "
+                      f"Security Score: {orig_crypto.get('security_score', 'N/A')}/100")
+                print(f"Obfuscated - Crypto Ops: {obf_crypto.get('total_crypto_operations', 0)}, "
+                      f"Security Score: {obf_crypto.get('security_score', 'N/A')}/100")
+
+                orig_keys = orig_crypto.get('cryptographic_keys', {}).get('total_exposed_keys', 0)
+                obf_keys = obf_crypto.get('cryptographic_keys', {}).get('total_exposed_keys', 0)
+                if orig_keys > 0 or obf_keys > 0:
+                    print(f"\n🔑 Hardcoded Keys - Original: {orig_keys}, Obfuscated: {obf_keys}")
+                    if obf_keys >= orig_keys and obf_keys > 0:
+                        print("⚠️  WARNING: Obfuscation did NOT hide hardcoded keys!")
 
             # Calculate obfuscation score
             print("\nCalculating obfuscation effectiveness...")
@@ -2114,7 +3292,14 @@ class APKAnalyzer:
         score = 0
         max_score = 100
 
-        # Identifier obfuscation (40 points)
+        # Scoring breakdown for comparison:
+        # - Identifiers: 35 points
+        # - Strings: 25 points
+        # - Control Flow: 20 points
+        # - Packages: 10 points
+        # - Resources: 10 points (if available)
+
+        # Identifier obfuscation (35 points)
         orig_ident = original['identifiers']
         obf_ident = obfuscated['identifiers']
 
@@ -2124,14 +3309,14 @@ class APKAnalyzer:
                 obf_ident.get('single_char_class_percentage', 0) -
                 orig_ident.get('single_char_class_percentage', 0)
             )
-            score += min(single_char_increase * 0.5, 15)
+            score += min(single_char_increase * 0.5, 13)
 
             # Meaningful name decrease
             meaningful_decrease = (
                 orig_ident.get('meaningful_class_percentage', 0) -
                 obf_ident.get('meaningful_class_percentage', 0)
             )
-            score += min(meaningful_decrease * 0.3, 15)
+            score += min(meaningful_decrease * 0.3, 13)
 
             # Average length decrease
             length_decrease = (
@@ -2139,11 +3324,11 @@ class APKAnalyzer:
                 obf_ident.get('avg_class_length', 10)
             )
             if length_decrease > 0:
-                score += min(length_decrease * 2, 10)
+                score += min(length_decrease * 2, 9)
 
         comparison['changes']['identifier_score'] = score
 
-        # String obfuscation (30 points)
+        # String obfuscation (25 points)
         orig_str = original['strings']
         obf_str = obfuscated['strings']
 
@@ -2153,10 +3338,10 @@ class APKAnalyzer:
                 obf_str.get('encrypted_string_percentage', 0) -
                 orig_str.get('encrypted_string_percentage', 0)
             )
-            string_score += min(encrypted_increase * 0.5, 20)
+            string_score += min(encrypted_increase * 0.5, 17)
 
             if obf_str.get('decryption_methods', 0) > 0:
-                string_score += 10
+                string_score += 8
 
         score += string_score
         comparison['changes']['string_score'] = string_score
@@ -2193,6 +3378,53 @@ class APKAnalyzer:
 
         score += pkg_score
         comparison['changes']['package_score'] = pkg_score
+
+        # Resource obfuscation (10 points) - only if both have resource analysis
+        orig_res = original.get('resources')
+        obf_res = obfuscated.get('resources')
+
+        res_score = 0
+        if orig_res and obf_res:
+            orig_res_names = orig_res.get('resource_names', {})
+            obf_res_names = obf_res.get('resource_names', {})
+
+            orig_total = orig_res_names.get('total_resources', 0)
+            obf_total = obf_res_names.get('total_resources', 0)
+
+            if orig_total > 0 and obf_total > 0:
+                # Resource name obfuscation increase
+                orig_obf_ratio = orig_res_names.get('obfuscated_names', 0) / orig_total
+                obf_obf_ratio = obf_res_names.get('obfuscated_names', 0) / obf_total
+                obf_increase = (obf_obf_ratio - orig_obf_ratio) * 100
+
+                if obf_increase > 0:
+                    res_score += min(obf_increase * 0.1, 5)
+
+                # Short name ratio increase
+                orig_short_ratio = orig_res_names.get('short_names', 0) / orig_total
+                obf_short_ratio = obf_res_names.get('short_names', 0) / obf_total
+                short_increase = (obf_short_ratio - orig_short_ratio) * 100
+
+                if short_increase > 0:
+                    res_score += min(short_increase * 0.05, 3)
+
+            # String resource encryption
+            orig_res_str = orig_res.get('string_resources', {})
+            obf_res_str = obf_res.get('string_resources', {})
+
+            orig_str_total = orig_res_str.get('total_strings', 0)
+            obf_str_total = obf_res_str.get('total_strings', 0)
+
+            if orig_str_total > 0 and obf_str_total > 0:
+                orig_enc_ratio = orig_res_str.get('encrypted_strings', 0) / orig_str_total
+                obf_enc_ratio = obf_res_str.get('encrypted_strings', 0) / obf_str_total
+                enc_increase = (obf_enc_ratio - orig_enc_ratio) * 100
+
+                if enc_increase > 0:
+                    res_score += min(enc_increase * 0.1, 2)
+
+        score += res_score
+        comparison['changes']['resource_score'] = res_score
 
         comparison['obfuscation_score'] = min(score, max_score)
 
@@ -2435,6 +3667,41 @@ class APKAnalyzer:
         <h2>Recommendations</h2>
         {"".join([f'<div class="recommendation">{rec}</div>' for rec in comparison['recommendations']])}
 
+        <div style="background-color: #e3f2fd; border-left: 4px solid #2196f3; padding: 20px; margin: 20px 0; border-radius: 4px;">
+            <h3 style="color: #1565c0; margin-top: 0;">ℹ️ Understanding Obfuscation</h3>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <strong>Obfuscation is a resilience mechanism</strong> that increases the cost and difficulty of reverse engineering.
+            </p>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <strong>What obfuscation DOES protect:</strong>
+            </p>
+            <ul style="color: #1565c0;">
+                <li><strong>Confidentiality of Code Logic:</strong> Makes it harder to understand how your algorithms and business logic work</li>
+                <li><strong>Intellectual Property:</strong> Protects proprietary algorithms and implementation details from competitors</li>
+                <li><strong>Raises Reverse Engineering Cost:</strong> Forces attackers to spend more time and effort analyzing your code</li>
+            </ul>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <strong>What obfuscation does NOT provide:</strong>
+            </p>
+            <ul style="color: #1565c0;">
+                <li><strong>NOT Anti-Tamper:</strong> Does not prevent code modification, repackaging, or injection attacks</li>
+                <li><strong>NOT Integrity Checking:</strong> Does not detect if your code has been modified or tampered with</li>
+                <li><strong>NOT Secret Protection:</strong> Cannot protect hardcoded API keys, passwords, or cryptographic keys (these can still be extracted)</li>
+                <li><strong>NOT Runtime Protection:</strong> Does not prevent debugging, hooking, or dynamic analysis at runtime</li>
+            </ul>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <strong>For comprehensive protection, combine obfuscation with:</strong>
+            </p>
+            <ul style="color: #1565c0;">
+                <li><strong>Integrity Protection:</strong> Code signing, certificate pinning, runtime integrity checks, anti-tamper mechanisms</li>
+                <li><strong>Secret Management:</strong> Never hardcode secrets; use Android Keystore, server-side validation, secure enclaves</li>
+                <li><strong>Runtime Protection:</strong> RASP, root/jailbreak detection, anti-debugging, SSL pinning</li>
+            </ul>
+            <p style="color: #1565c0; margin: 10px 0;">
+                <em>Obfuscation is one important layer in a defense-in-depth security strategy, not a complete solution.</em>
+            </p>
+        </div>
+
         <h2>Sensitive Strings Analysis</h2>
         <div class="comparison">
             <div class="comparison-item">
@@ -2495,6 +3762,20 @@ class APKAnalyzer:
             <div class="comparison-item">
                 <h3>Obfuscated APK</h3>
                 {self._format_metrics(comparison['obfuscated']['packages'])}
+            </div>
+        </div>
+
+        {self._format_resources_html(comparison['original'].get('resources'), comparison['obfuscated'].get('resources'))}
+
+        <h2>🔐 Cryptographic Security Comparison</h2>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0;">
+            <div>
+                <h3>Original APK</h3>
+                {self._format_cryptography_html(comparison['original'].get('cryptography', {}))}
+            </div>
+            <div>
+                <h3>Obfuscated APK</h3>
+                {self._format_cryptography_html(comparison['obfuscated'].get('cryptography', {}))}
             </div>
         </div>
 
@@ -2609,6 +3890,58 @@ class APKAnalyzer:
                 html += '</div>'
         elif signature.get('note'):
             html += f'<div style="color: #6c757d; margin: 10px 0; font-style: italic;">{signature["note"]}</div>'
+
+        # Validation results
+        validation = metadata.get('validation', {})
+        if validation:
+            html += '<h3 style="color: #34495e; margin-top: 20px;">🔍 File Structure Validation</h3>'
+
+            if validation.get('valid'):
+                html += '<div style="background: #d4edda; border: 1px solid #c3e6cb; border-radius: 4px; padding: 15px; margin: 10px 0;">'
+                html += '<div style="color: #155724; font-weight: bold;">✓ File structure is valid</div>'
+                html += '</div>'
+            else:
+                # Issues section
+                issues = validation.get('issues', [])
+                if issues:
+                    html += '<div style="background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 4px; padding: 15px; margin: 10px 0;">'
+                    html += '<div style="color: #721c24; font-weight: bold; margin-bottom: 10px;">⚠️ File Structure Issues Detected</div>'
+                    html += '<ul style="color: #721c24; margin: 10px 0; padding-left: 20px;">'
+                    for issue in issues:
+                        html += f'<li style="margin: 5px 0;">{issue}</li>'
+                    html += '</ul>'
+                    html += '</div>'
+
+                # Warnings section
+                warnings = validation.get('warnings', [])
+                if warnings:
+                    html += '<div style="background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 15px; margin: 10px 0;">'
+                    html += '<div style="color: #856404; font-weight: bold; margin-bottom: 10px;">⚠ Warnings</div>'
+                    html += '<ul style="color: #856404; margin: 10px 0; padding-left: 20px;">'
+                    for warning in warnings:
+                        html += f'<li style="margin: 5px 0;">{warning}</li>'
+                    html += '</ul>'
+                    html += '</div>'
+
+                # Repair suggestions section
+                repair_suggestions = validation.get('repair_suggestions', [])
+                if repair_suggestions:
+                    html += '<div style="background: #e7f3ff; border: 1px solid #2196f3; border-radius: 4px; padding: 15px; margin: 10px 0;">'
+                    html += '<div style="color: #0d47a1; font-weight: bold; margin-bottom: 10px;">🔧 Repair Suggestions</div>'
+                    html += '<ul style="color: #0d47a1; margin: 10px 0; padding-left: 20px;">'
+                    for suggestion in repair_suggestions:
+                        html += f'<li style="margin: 5px 0;"><code style="background: #fff; padding: 2px 6px; border-radius: 3px; font-size: 13px;">{suggestion}</code></li>'
+                    html += '</ul>'
+                    html += '</div>'
+
+            # Show checks performed
+            checks = validation.get('checks_performed', {})
+            if checks:
+                html += '<div style="margin-top: 15px; padding: 10px; background: #f8f9fa; border-radius: 4px; font-size: 13px;">'
+                html += '<strong>Validation Checks Performed:</strong> '
+                performed_checks = [name.replace('_', ' ').title() for name, done in checks.items() if done]
+                html += ', '.join(performed_checks) if performed_checks else 'None'
+                html += '</div>'
 
         html += '</div>'
         return html
@@ -2736,6 +4069,438 @@ class APKAnalyzer:
         html += '</div>'
         return html
 
+    def _format_cryptography_html(self, crypto):
+        """
+        Format cryptographic analysis for HTML report
+
+        Args:
+            crypto: Cryptography analysis dictionary
+
+        Returns:
+            HTML string with formatted crypto section
+        """
+        if not crypto or crypto.get('total_crypto_operations', 0) == 0:
+            return '''
+        <h2>🔐 Cryptographic Analysis</h2>
+        <div style="background-color: #e8f5e9; padding: 20px; border-radius: 8px; border-left: 4px solid #4caf50;">
+            <p><strong>✓ No cryptographic operations detected</strong></p>
+            <p>This file does not appear to contain cryptographic code.</p>
+        </div>
+'''
+
+        html = '<h2>🔐 Cryptographic Security Analysis</h2>'
+
+        # Security Score Box
+        score = crypto.get('security_score', 0)
+        score_color = '#4caf50' if score >= 80 else '#ff9800' if score >= 50 else '#f44336'
+        score_status = 'GOOD' if score >= 80 else 'FAIR' if score >= 50 else 'POOR'
+
+        html += f'''
+        <div style="background: {score_color}; color: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
+            <h3 style="margin: 0; color: white;">Crypto Security Score: {score}/100 ({score_status})</h3>
+            <p style="margin: 5px 0 0 0; color: white;">Total Cryptographic Operations: {crypto.get('total_crypto_operations', 0)}</p>
+        </div>
+'''
+
+        # Security Issues (CRITICAL)
+        issues = crypto.get('security_issues', [])
+        if issues:
+            html += '<div style="background: #ffebee; padding: 20px; border-radius: 8px; border-left: 4px solid #f44336; margin: 20px 0;">'
+            html += f'<h3 style="color: #c62828; margin-top: 0;">⚠️ Security Issues Found ({len(issues)})</h3>'
+
+            for issue in issues:
+                severity_color = '#d32f2f' if issue['severity'] == 'CRITICAL' else '#f57c00' if issue['severity'] == 'HIGH' else '#fbc02d'
+                html += f'''
+                <div style="background: white; padding: 15px; margin: 10px 0; border-radius: 4px; border-left: 3px solid {severity_color};">
+                    <div style="font-weight: bold; color: {severity_color};">[{issue['severity']}] {issue['category']}</div>
+                    <div style="margin: 5px 0;"><strong>Issue:</strong> {issue['description']}</div>
+                    <div style="margin: 5px 0;"><strong>Impact:</strong> {issue['impact']}</div>
+                    <div style="margin: 5px 0; color: #666; font-size: 12px;"><strong>CWE:</strong> {issue.get('cwe', 'N/A')}</div>
+                </div>
+'''
+            html += '</div>'
+
+        # Hardcoded Keys (CRITICAL SECTION)
+        keys = crypto.get('cryptographic_keys', {})
+        total_keys = keys.get('total_exposed_keys', 0)
+        if total_keys > 0:
+            html += '<div style="background: #ffebee; padding: 20px; border-radius: 8px; border-left: 4px solid #d32f2f; margin: 20px 0;">'
+            html += f'<h3 style="color: #c62828; margin-top: 0;">🔑 HARDCODED CRYPTOGRAPHIC KEYS ({total_keys} found)</h3>'
+            html += '<p style="color: #d32f2f; font-weight: bold;">CRITICAL SECURITY RISK: Cryptographic keys found in source code!</p>'
+
+            # Hardcoded SecretKeySpec
+            if keys.get('hardcoded_keys'):
+                html += '<h4 style="color: #c62828;">SecretKeySpec with Hardcoded Keys:</h4><ul>'
+                for key in keys['hardcoded_keys'][:5]:
+                    html += f'<li><strong>File:</strong> {key["file"]}<br><code style="background: #f5f5f5; padding: 5px; display: block; margin: 5px 0; overflow-x: auto;">{key["context"][:200]}</code></li>'
+                if len(keys['hardcoded_keys']) > 5:
+                    html += f'<li><em>... and {len(keys["hardcoded_keys"]) - 5} more</em></li>'
+                html += '</ul>'
+
+            # PEM Keys
+            if keys.get('pem_keys'):
+                html += '<h4 style="color: #c62828;">PEM-Formatted Keys:</h4><ul>'
+                for key in keys['pem_keys'][:5]:
+                    html += f'<li><strong>File:</strong> {key["file"]}<br><strong>Type:</strong> {key["type"]}<br><code style="background: #f5f5f5; padding: 5px; display: block; margin: 5px 0;">{key["key_preview"]}</code></li>'
+                if len(keys['pem_keys']) > 5:
+                    html += f'<li><em>... and {len(keys["pem_keys"]) - 5} more</em></li>'
+                html += '</ul>'
+
+            # Base64 Keys
+            if keys.get('base64_keys'):
+                html += '<h4 style="color: #f57c00;">Potential Base64-Encoded Keys:</h4><ul>'
+                for key in keys['base64_keys'][:5]:
+                    html += f'<li><strong>File:</strong> {key["file"]}<br><strong>Possible Key Size:</strong> {key["possible_key_size"]} bits<br><code style="background: #f5f5f5; padding: 5px;">{key["base64_string"]}</code></li>'
+                if len(keys['base64_keys']) > 5:
+                    html += f'<li><em>... and {len(keys["base64_keys"]) - 5} more</em></li>'
+                html += '</ul>'
+
+            # Hex Keys
+            if keys.get('hex_keys'):
+                html += '<h4 style="color: #f57c00;">Potential Hex-Encoded Keys:</h4><ul>'
+                for key in keys['hex_keys'][:5]:
+                    html += f'<li><strong>File:</strong> {key["file"]}<br><strong>Possible Key Size:</strong> {key["possible_key_size"]} bits<br><code style="background: #f5f5f5; padding: 5px;">{key["hex_string"]}</code></li>'
+                if len(keys['hex_keys']) > 5:
+                    html += f'<li><em>... and {len(keys["hex_keys"]) - 5} more</em></li>'
+                html += '</ul>'
+
+            html += '</div>'
+
+        # Weak Cryptography
+        weak = crypto.get('weak_crypto', {})
+        has_weak = any([weak.get('md5_usage'), weak.get('des_usage'), weak.get('ecb_mode_usage'),
+                       weak.get('sha1_signature_usage'), weak.get('insecure_random')])
+
+        if has_weak:
+            html += '<div style="background: #fff3e0; padding: 20px; border-radius: 8px; border-left: 4px solid #f57c00; margin: 20px 0;">'
+            html += '<h3 style="color: #e65100; margin-top: 0;">⚠️ Weak/Insecure Cryptography Detected</h3>'
+
+            if weak.get('md5_usage'):
+                html += f'<div style="margin: 10px 0;"><strong style="color: #d32f2f;">MD5 Usage ({len(weak["md5_usage"])} instances):</strong> MD5 is cryptographically broken<ul>'
+                for item in weak['md5_usage'][:3]:
+                    html += f'<li>File: {item["file"]}</li>'
+                html += '</ul></div>'
+
+            if weak.get('des_usage'):
+                html += f'<div style="margin: 10px 0;"><strong style="color: #d32f2f;">DES/3DES Usage ({len(weak["des_usage"])} instances):</strong> Vulnerable to brute force<ul>'
+                for item in weak['des_usage'][:3]:
+                    html += f'<li>File: {item["file"]}</li>'
+                html += '</ul></div>'
+
+            if weak.get('ecb_mode_usage'):
+                html += f'<div style="margin: 10px 0;"><strong style="color: #f57c00;">ECB Mode ({len(weak["ecb_mode_usage"])} instances):</strong> Insecure cipher mode<ul>'
+                for item in weak['ecb_mode_usage'][:3]:
+                    html += f'<li>File: {item["file"]}</li>'
+                html += '</ul></div>'
+
+            if weak.get('sha1_signature_usage'):
+                html += f'<div style="margin: 10px 0;"><strong style="color: #f57c00;">SHA1 Signatures ({len(weak["sha1_signature_usage"])} instances):</strong> Deprecated for signatures<ul>'
+                for item in weak['sha1_signature_usage'][:3]:
+                    html += f'<li>File: {item["file"]}</li>'
+                html += '</ul></div>'
+
+            if weak.get('insecure_random'):
+                html += f'<div style="margin: 10px 0;"><strong style="color: #f57c00;">Insecure Random ({len(weak["insecure_random"])} instances):</strong> Using Random instead of SecureRandom<ul>'
+                for item in weak['insecure_random'][:3]:
+                    html += f'<li>File: {item["file"]}</li>'
+                html += '</ul></div>'
+
+            html += '</div>'
+
+        # Crypto Operations Summary
+        ops = crypto.get('crypto_operations', {})
+        if crypto.get('total_crypto_operations', 0) > 0:
+            html += '<div style="background: #e3f2fd; padding: 20px; border-radius: 8px; margin: 20px 0;">'
+            html += '<h3 style="color: #1565c0; margin-top: 0;">Cryptographic Operations Found</h3>'
+
+            if ops.get('cipher_instances'):
+                html += f'<div style="margin: 10px 0;"><strong>Cipher Instances ({len(ops["cipher_instances"])}):</strong><ul>'
+                for op in ops['cipher_instances'][:5]:
+                    html += f'<li><strong>Algorithm:</strong> {op["algorithm"]} | <strong>File:</strong> {op["file"]}</li>'
+                html += '</ul></div>'
+
+            if ops.get('key_generators'):
+                html += f'<div style="margin: 10px 0;"><strong>Key Generators ({len(ops["key_generators"])}):</strong><ul>'
+                for op in ops['key_generators'][:5]:
+                    html += f'<li><strong>Algorithm:</strong> {op["algorithm"]} | <strong>File:</strong> {op["file"]}</li>'
+                html += '</ul></div>'
+
+            if ops.get('message_digests'):
+                html += f'<div style="margin: 10px 0;"><strong>Message Digests ({len(ops["message_digests"])}):</strong><ul>'
+                for op in ops['message_digests'][:5]:
+                    html += f'<li><strong>Algorithm:</strong> {op["algorithm"]} | <strong>File:</strong> {op["file"]}</li>'
+                html += '</ul></div>'
+
+            html += '</div>'
+
+        # Crypto Providers Used (comprehensive breakdown)
+        providers = crypto.get('crypto_providers', {})
+        modern_providers = [(name, data) for name, data in providers.items() if data.get('used') and data.get('type') == 'modern']
+        standard_providers = [(name, data) for name, data in providers.items() if data.get('used') and data.get('type') == 'standard']
+        legacy_providers = [(name, data) for name, data in providers.items() if data.get('used') and data.get('type') == 'legacy']
+
+        if modern_providers or standard_providers or legacy_providers:
+            html += '<div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">'
+            html += '<h3 style="margin-top: 0;">🔧 Cryptographic Providers Detected</h3>'
+
+            # Modern providers (good)
+            if modern_providers:
+                html += '<div style="margin: 15px 0;">'
+                html += '<h4 style="color: #2e7d32;">✓ Modern Providers (Recommended)</h4>'
+                html += '<ul>'
+                for name, data in modern_providers:
+                    html += f'<li><strong>{data["description"]}</strong><br>'
+                    html += f'<span style="color: #666; font-size: 13px;">Used in {data["count"]} classes</span></li>'
+                html += '</ul>'
+                html += '</div>'
+
+            # Standard providers (neutral)
+            if standard_providers:
+                html += '<div style="margin: 15px 0;">'
+                html += '<h4 style="color: #1976d2;">Standard Java Crypto APIs</h4>'
+                html += '<ul>'
+                for name, data in standard_providers:
+                    html += f'<li><strong>{data["description"]}</strong><br>'
+                    html += f'<span style="color: #666; font-size: 13px;">Used in {data["count"]} classes</span></li>'
+                html += '</ul>'
+                html += '</div>'
+
+            # Legacy providers (warning)
+            if legacy_providers:
+                html += '<div style="margin: 15px 0; background: #fff3e0; padding: 15px; border-radius: 4px; border-left: 3px solid #f57c00;">'
+                html += '<h4 style="color: #e65100; margin-top: 0;">⚠️ Legacy/Deprecated Providers</h4>'
+                html += '<ul style="color: #e65100;">'
+                for name, data in legacy_providers:
+                    html += f'<li><strong>{data["description"]}</strong><br>'
+                    html += f'<span style="color: #666; font-size: 13px;">Used in {data["count"]} classes - Consider migrating to modern alternatives</span></li>'
+                html += '</ul>'
+                html += '</div>'
+
+            html += '</div>'
+
+        # Crypto Libraries Used (legacy display for backward compatibility)
+        libs = crypto.get('crypto_libraries', {})
+        libs_used = [name for name, data in libs.items() if data.get('used')]
+        if libs_used and not (modern_providers or standard_providers or legacy_providers):
+            # Only show if providers section wasn't shown
+            html += '<div style="background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0;">'
+            html += '<h3 style="margin-top: 0;">Cryptographic Libraries Detected</h3><ul>'
+            for lib_name in libs_used:
+                lib_data = libs[lib_name]
+                html += f'<li><strong>{lib_name}:</strong> {lib_data["count"]} classes</li>'
+            html += '</ul></div>'
+
+        # White-Box Cryptography Recommendation (Special Section if egregious issues)
+        if crypto.get('egregious_crypto_detected'):
+            egregious_issues = crypto.get('egregious_issues', [])
+            issues_list = ', '.join(egregious_issues)
+
+            html += '<div style="background: #fff3e0; padding: 25px; border-radius: 8px; border-left: 6px solid #ff6f00; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.15);">'
+            html += '<h3 style="color: #e65100; margin-top: 0;">⚠️ EGREGIOUS CRYPTOGRAPHY DETECTED</h3>'
+            html += f'<p style="color: #e65100; font-weight: bold;">Critical Issues Found: {issues_list}</p>'
+
+            html += '<div style="background: white; padding: 20px; border-radius: 6px; margin: 15px 0;">'
+            html += '<h4 style="color: #d84315; margin-top: 0;">🔐 Consider White-Box Cryptography (WBC) Solutions</h4>'
+
+            html += '<p style="margin: 10px 0;">White-Box Cryptography can provide additional protection when standard crypto has severe weaknesses:</p>'
+
+            html += '<table style="width: 100%; border-collapse: collapse; margin: 15px 0;">'
+            html += '<tr style="background: #f5f5f5;"><th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">Provider</th><th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">Features</th></tr>'
+
+            html += '<tr><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Irdeto White-Box</strong><br><span style="color: #666; font-size: 12px;">Commercial</span></td>'
+            html += '<td style="padding: 10px; border-bottom: 1px solid #eee;">Enterprise-grade WBC with key hiding, anti-tampering, and DRM support</td></tr>'
+
+            html += '<tr><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Arxan Application Protection</strong><br><span style="color: #666; font-size: 12px;">Commercial</span></td>'
+            html += '<td style="padding: 10px; border-bottom: 1px solid #eee;">WBC + code protection + runtime integrity + anti-debugging</td></tr>'
+
+            html += '<tr><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Gemalto Sentinel (Thales)</strong><br><span style="color: #666; font-size: 12px;">Commercial</span></td>'
+            html += '<td style="padding: 10px; border-bottom: 1px solid #eee;">WBC with software licensing, DRM integration, and cloud key management</td></tr>'
+
+            html += '<tr><td style="padding: 10px; border-bottom: 1px solid #eee;"><strong>Inside Secure (Verimatrix)</strong><br><span style="color: #666; font-size: 12px;">Commercial</span></td>'
+            html += '<td style="padding: 10px; border-bottom: 1px solid #eee;">Mobile-optimized WBC with low performance overhead</td></tr>'
+
+            html += '</table>'
+
+            html += '<div style="background: #ffebee; padding: 15px; border-radius: 4px; margin: 15px 0; border-left: 3px solid #d32f2f;">'
+            html += '<h5 style="margin-top: 0; color: #c62828;">⚠️ Important WBC Limitations</h5>'
+            html += '<ul style="margin: 10px 0; color: #c62828;">'
+            html += '<li><strong>WBC is NOT a replacement for fixing broken crypto</strong> - Fix weak algorithms (MD5, DES) first!</li>'
+            html += '<li>WBC increases reverse engineering cost but does not eliminate extraction risks</li>'
+            html += '<li>Performance impact: WBC can be 10-100x slower than standard crypto</li>'
+            html += '<li>WBC works best for protecting small, critical crypto operations (not bulk encryption)</li>'
+            html += '</ul>'
+            html += '</div>'
+
+            html += '<div style="background: #e3f2fd; padding: 15px; border-radius: 4px; margin: 15px 0;">'
+            html += '<h5 style="margin-top: 0; color: #1565c0;">✓ Best Practices with WBC</h5>'
+            html += '<ul style="margin: 10px 0; color: #1565c0;">'
+            html += '<li>Combine WBC with obfuscation, anti-debugging, and runtime integrity checks</li>'
+            html += '<li>Use WBC for authentication tokens, license verification, and session keys</li>'
+            html += '<li>Store WBC implementations in native code (C/C++) for added protection</li>'
+            html += '<li>Implement key diversification - different keys per device/user</li>'
+            html += '<li>Use Android Keystore for additional hardware-backed key protection</li>'
+            html += '</ul>'
+            html += '</div>'
+
+            html += '</div></div>'
+
+        # Recommendations
+        recommendations = crypto.get('recommendations', [])
+        if recommendations:
+            html += '<div style="background: #e8f5e9; padding: 20px; border-radius: 8px; border-left: 4px solid #4caf50; margin: 20px 0;">'
+            html += '<h3 style="color: #2e7d32; margin-top: 0;">📋 Recommendations</h3><ul>'
+            for rec in recommendations:
+                # Skip WBC recommendations in main list if already shown in special section
+                if crypto.get('egregious_crypto_detected') and ('WBC' in rec or 'White-Box' in rec or 'Irdeto' in rec or 'Arxan' in rec):
+                    continue
+                if rec.startswith('✓'):
+                    html += f'<li style="color: #2e7d32;">{rec}</li>'
+                elif rec.strip() == '':
+                    continue  # Skip blank lines
+                else:
+                    html += f'<li>{rec}</li>'
+            html += '</ul></div>'
+
+        return html
+
+    def _format_single_resources_html(self, resources):
+        """
+        Format resource analysis for single file HTML report
+
+        Args:
+            resources: Resource analysis dictionary or None
+
+        Returns:
+            HTML string with formatted resource section
+        """
+        if not resources:
+            return '''
+        <h2>Resource Analysis</h2>
+        <div style="background-color: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
+            <p><strong>ℹ️ Resource analysis not available</strong></p>
+            <p>Install androguard to enable resource obfuscation analysis:</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 3px;">pip install androguard</pre>
+        </div>
+'''
+
+        res_names = resources.get('resource_names', {})
+        res_strings = resources.get('string_resources', {})
+        res_types = resources.get('resource_types', {})
+        indicators = resources.get('obfuscation_indicators', {})
+
+        total_resources = res_names.get('total_resources', 0)
+
+        html = '<h2>Resource Analysis</h2>'
+        html += '<div style="background-color: #e8f5e9; padding: 15px; border-radius: 5px; margin: 10px 0;">'
+
+        # Resource names summary
+        html += '<h3>Resource Names</h3>'
+        html += f'<div class="metric"><strong>Total Resources:</strong> {total_resources}</div>'
+        html += f'<div class="metric"><strong>Obfuscated Names:</strong> {res_names.get("obfuscated_names", 0)} ({(res_names.get("obfuscated_names", 0)/max(total_resources,1)*100):.1f}%)</div>'
+        html += f'<div class="metric"><strong>Short Names (≤2 chars):</strong> {res_names.get("short_names", 0)} ({(res_names.get("short_names", 0)/max(total_resources,1)*100):.1f}%)</div>'
+        html += f'<div class="metric"><strong>Meaningful Names:</strong> {res_names.get("meaningful_names", 0)} ({(res_names.get("meaningful_names", 0)/max(total_resources,1)*100):.1f}%)</div>'
+        html += f'<div class="metric"><strong>Average Name Length:</strong> {res_names.get("avg_name_length", 0):.2f}</div>'
+
+        # String resources
+        total_strings = res_strings.get('total_strings', 0)
+        if total_strings > 0:
+            html += '<h3>String Resources</h3>'
+            html += f'<div class="metric"><strong>Total String Resources:</strong> {total_strings}</div>'
+            html += f'<div class="metric"><strong>Encrypted Strings:</strong> {res_strings.get("encrypted_strings", 0)} ({(res_strings.get("encrypted_strings", 0)/max(total_strings,1)*100):.1f}%)</div>'
+            html += f'<div class="metric"><strong>Base64 Encoded:</strong> {res_strings.get("base64_strings", 0)}</div>'
+            html += f'<div class="metric"><strong>Average Entropy:</strong> {res_strings.get("avg_string_entropy", 0):.2f}</div>'
+
+        # Resource types breakdown
+        if res_types:
+            html += '<h3>Resource Types</h3>'
+            html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">'
+            for res_type, count in sorted(res_types.items(), key=lambda x: x[1], reverse=True)[:10]:
+                html += f'<div class="metric"><strong>{res_type}:</strong> {count}</div>'
+            html += '</div>'
+
+        # Obfuscation indicators
+        if any(indicators.values()):
+            html += '<h3>Obfuscation Indicators</h3>'
+            if indicators.get('high_obfuscated_ratio'):
+                html += '<div style="color: #4caf50;">✓ High resource name obfuscation detected</div>'
+            if indicators.get('short_name_dominance'):
+                html += '<div style="color: #4caf50;">✓ Short resource names dominant</div>'
+            if indicators.get('sequential_naming'):
+                html += '<div style="color: #4caf50;">✓ Sequential naming pattern detected</div>'
+            if indicators.get('encrypted_string_ratio'):
+                html += '<div style="color: #4caf50;">✓ High string resource encryption</div>'
+
+        html += '</div>'
+        return html
+
+    def _format_resources_html(self, orig_resources, obf_resources):
+        """
+        Format resource analysis comparison for HTML report
+
+        Args:
+            orig_resources: Original resource analysis dictionary or None
+            obf_resources: Obfuscated resource analysis dictionary or None
+
+        Returns:
+            HTML string with formatted resource comparison section
+        """
+        if not orig_resources or not obf_resources:
+            if not orig_resources and not obf_resources:
+                return '''
+        <h2>Resource Analysis</h2>
+        <div style="background-color: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
+            <p><strong>ℹ️ Resource analysis not available</strong></p>
+            <p>Install androguard to enable resource obfuscation analysis:</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 3px;">pip install androguard</pre>
+        </div>
+'''
+            else:
+                return ''  # Skip if only one has resources
+
+        html = '<h2>Resource Obfuscation</h2>'
+        html += '<div class="comparison">'
+
+        # Original
+        html += '<div class="comparison-item">'
+        html += '<h3>Original APK</h3>'
+        orig_names = orig_resources.get('resource_names', {})
+        orig_strings = orig_resources.get('string_resources', {})
+        orig_total = orig_names.get('total_resources', 0)
+
+        html += f'<div class="metric"><strong>Total Resources:</strong> {orig_total}</div>'
+        html += f'<div class="metric"><strong>Obfuscated Names:</strong> {orig_names.get("obfuscated_names", 0)} ({(orig_names.get("obfuscated_names", 0)/max(orig_total,1)*100):.1f}%)</div>'
+        html += f'<div class="metric"><strong>Short Names:</strong> {orig_names.get("short_names", 0)} ({(orig_names.get("short_names", 0)/max(orig_total,1)*100):.1f}%)</div>'
+        html += f'<div class="metric"><strong>Avg Name Length:</strong> {orig_names.get("avg_name_length", 0):.2f}</div>'
+
+        orig_str_total = orig_strings.get('total_strings', 0)
+        if orig_str_total > 0:
+            html += f'<div class="metric"><strong>String Resources:</strong> {orig_str_total}</div>'
+            html += f'<div class="metric"><strong>Encrypted Strings:</strong> {orig_strings.get("encrypted_strings", 0)} ({(orig_strings.get("encrypted_strings", 0)/max(orig_str_total,1)*100):.1f}%)</div>'
+
+        html += '</div>'
+
+        # Obfuscated
+        html += '<div class="comparison-item">'
+        html += '<h3>Obfuscated APK</h3>'
+        obf_names = obf_resources.get('resource_names', {})
+        obf_strings = obf_resources.get('string_resources', {})
+        obf_total = obf_names.get('total_resources', 0)
+
+        html += f'<div class="metric"><strong>Total Resources:</strong> {obf_total}</div>'
+        html += f'<div class="metric"><strong>Obfuscated Names:</strong> {obf_names.get("obfuscated_names", 0)} ({(obf_names.get("obfuscated_names", 0)/max(obf_total,1)*100):.1f}%)</div>'
+        html += f'<div class="metric"><strong>Short Names:</strong> {obf_names.get("short_names", 0)} ({(obf_names.get("short_names", 0)/max(obf_total,1)*100):.1f}%)</div>'
+        html += f'<div class="metric"><strong>Avg Name Length:</strong> {obf_names.get("avg_name_length", 0):.2f}</div>'
+
+        obf_str_total = obf_strings.get('total_strings', 0)
+        if obf_str_total > 0:
+            html += f'<div class="metric"><strong>String Resources:</strong> {obf_str_total}</div>'
+            html += f'<div class="metric"><strong>Encrypted Strings:</strong> {obf_strings.get("encrypted_strings", 0)} ({(obf_strings.get("encrypted_strings", 0)/max(obf_str_total,1)*100):.1f}%)</div>'
+
+        html += '</div>'
+        html += '</div>'
+
+        return html
+
     def _create_comparison_table(self, original, obfuscated):
         """Create comparison table for identifiers"""
         html = "<table>"
@@ -2847,6 +4612,27 @@ class APKAnalyzer:
         print("\nRecommendations:")
         for i, rec in enumerate(comparison['recommendations'], 1):
             print(f"  {i}. {rec}")
+
+        # Educational security notice
+        print(f"\n{'='*60}")
+        print("ℹ️  UNDERSTANDING OBFUSCATION")
+        print(f"{'='*60}\n")
+        print("Obfuscation is a RESILIENCE MECHANISM that increases the cost")
+        print("and difficulty of reverse engineering.\n")
+        print("What obfuscation DOES protect:")
+        print("  ✓ Confidentiality of Code Logic: Makes algorithms & business logic harder to understand")
+        print("  ✓ Intellectual Property: Protects proprietary implementation details")
+        print("  ✓ Raises Reverse Engineering Cost: Forces attackers to spend more time & effort\n")
+        print("What obfuscation does NOT provide:")
+        print("  ✗ NOT Anti-Tamper: Does not prevent code modification or repackaging")
+        print("  ✗ NOT Integrity Checking: Does not detect if code has been tampered with")
+        print("  ✗ NOT Secret Protection: Cannot protect hardcoded keys/passwords (still extractable)")
+        print("  ✗ NOT Runtime Protection: Does not prevent debugging or dynamic analysis\n")
+        print("For comprehensive protection, combine obfuscation with:")
+        print("  • Integrity: Code signing, certificate pinning, runtime integrity checks, anti-tamper")
+        print("  • Secrets: Never hardcode; use Android Keystore, server-side validation")
+        print("  • Runtime: RASP, root detection, anti-debugging, SSL pinning\n")
+        print("Obfuscation is one important layer in defense-in-depth, not a complete solution.")
 
         print(f"\n{'='*60}\n")
 
