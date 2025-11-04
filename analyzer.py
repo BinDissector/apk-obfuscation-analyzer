@@ -1402,6 +1402,169 @@ class APKAnalyzer:
                 print(f"Warning: Failed to analyze resources: {e}")
             return None
 
+    def analyze_permissions(self, apk_path):
+        """
+        Analyze AndroidManifest.xml permissions with risk-based color coding
+
+        Extracts and categorizes all permissions by risk level:
+        - CRITICAL: High-risk permissions (SMS, Phone, Contacts, Location, etc.)
+        - HIGH: Sensitive permissions (Storage, Camera, Microphone)
+        - MEDIUM: Moderate permissions (Network, Bluetooth)
+        - LOW: Safe permissions (Internet, Vibrate)
+
+        Args:
+            apk_path: Path to APK file
+
+        Returns:
+            Dictionary with permission analysis or None if androguard unavailable
+        """
+        try:
+            from androguard.core.apk import APK as AndroAPK
+        except ImportError:
+            if self.verbose:
+                print("Warning: androguard not available for permission analysis")
+            return None
+
+        try:
+            self.log("Analyzing AndroidManifest.xml permissions...")
+            apk = AndroAPK(apk_path)
+
+            # Permission risk classification
+            CRITICAL_PERMS = {
+                'READ_CONTACTS', 'WRITE_CONTACTS', 'GET_ACCOUNTS',
+                'READ_CALL_LOG', 'WRITE_CALL_LOG', 'PROCESS_OUTGOING_CALLS',
+                'SEND_SMS', 'RECEIVE_SMS', 'READ_SMS', 'RECEIVE_MMS',
+                'READ_PHONE_STATE', 'CALL_PHONE', 'READ_PHONE_NUMBERS',
+                'ANSWER_PHONE_CALLS', 'ADD_VOICEMAIL',
+                'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION', 'ACCESS_BACKGROUND_LOCATION',
+                'READ_CALENDAR', 'WRITE_CALENDAR',
+                'BODY_SENSORS', 'ACTIVITY_RECOGNITION',
+                'USE_CREDENTIALS', 'MANAGE_ACCOUNTS', 'AUTHENTICATE_ACCOUNTS',
+                'INSTALL_PACKAGES', 'DELETE_PACKAGES', 'REQUEST_INSTALL_PACKAGES',
+                'SYSTEM_ALERT_WINDOW', 'WRITE_SETTINGS',
+                'ACCESS_SUPERUSER',  # Root access
+            }
+
+            HIGH_PERMS = {
+                'READ_EXTERNAL_STORAGE', 'WRITE_EXTERNAL_STORAGE',
+                'CAMERA', 'RECORD_AUDIO',
+                'READ_PROFILE', 'WRITE_PROFILE',
+                'ACCESS_MEDIA_LOCATION',
+                'ACCESS_NOTIFICATION_POLICY',
+                'BIND_ACCESSIBILITY_SERVICE',
+                'BIND_DEVICE_ADMIN',
+                'PACKAGE_USAGE_STATS',
+            }
+
+            MEDIUM_PERMS = {
+                'ACCESS_NETWORK_STATE', 'ACCESS_WIFI_STATE', 'CHANGE_WIFI_STATE',
+                'BLUETOOTH', 'BLUETOOTH_ADMIN', 'BLUETOOTH_CONNECT', 'BLUETOOTH_SCAN',
+                'NFC', 'CHANGE_NETWORK_STATE',
+                'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED',
+                'FOREGROUND_SERVICE',
+            }
+
+            LOW_PERMS = {
+                'INTERNET', 'VIBRATE', 'FLASHLIGHT',
+                'ACCESS_DOWNLOAD_MANAGER', 'DOWNLOAD_WITHOUT_NOTIFICATION',
+                'EXPAND_STATUS_BAR', 'KILL_BACKGROUND_PROCESSES',
+            }
+
+            # Get all permissions
+            permissions = apk.get_permissions()
+
+            # Categorize permissions
+            categorized = {
+                'critical': [],
+                'high': [],
+                'medium': [],
+                'low': [],
+                'unknown': []
+            }
+
+            for perm in permissions:
+                # Extract short name (e.g., "android.permission.INTERNET" -> "INTERNET")
+                short_name = perm.split('.')[-1]
+
+                perm_info = {
+                    'full_name': perm,
+                    'short_name': short_name,
+                    'risk_level': 'UNKNOWN'
+                }
+
+                # Classify by risk
+                if short_name in CRITICAL_PERMS:
+                    perm_info['risk_level'] = 'CRITICAL'
+                    categorized['critical'].append(perm_info)
+                elif short_name in HIGH_PERMS:
+                    perm_info['risk_level'] = 'HIGH'
+                    categorized['high'].append(perm_info)
+                elif short_name in MEDIUM_PERMS:
+                    perm_info['risk_level'] = 'MEDIUM'
+                    categorized['medium'].append(perm_info)
+                elif short_name in LOW_PERMS:
+                    perm_info['risk_level'] = 'LOW'
+                    categorized['low'].append(perm_info)
+                else:
+                    perm_info['risk_level'] = 'UNKNOWN'
+                    categorized['unknown'].append(perm_info)
+
+            # Get manifest metadata
+            manifest = apk.get_android_manifest_xml()
+            package_name = manifest.get('package') if manifest is not None else 'Unknown'
+
+            # Try to get version info
+            version_code = None
+            version_name = None
+            if manifest is not None:
+                # Android namespace
+                android_ns = '{http://schemas.android.com/apk/res/android}'
+                version_code = manifest.get(f'{android_ns}versionCode')
+                version_name = manifest.get(f'{android_ns}versionName')
+
+            analysis = {
+                'package_name': package_name,
+                'version_code': version_code,
+                'version_name': version_name,
+                'total_permissions': len(permissions),
+                'permissions_by_risk': categorized,
+                'risk_summary': {
+                    'critical_count': len(categorized['critical']),
+                    'high_count': len(categorized['high']),
+                    'medium_count': len(categorized['medium']),
+                    'low_count': len(categorized['low']),
+                    'unknown_count': len(categorized['unknown'])
+                },
+                'all_permissions': permissions  # Raw list for reference
+            }
+
+            # Calculate risk score (0-100, higher = more risky)
+            risk_score = 0
+            risk_score += len(categorized['critical']) * 10  # 10 points per critical
+            risk_score += len(categorized['high']) * 5       # 5 points per high
+            risk_score += len(categorized['medium']) * 2     # 2 points per medium
+            risk_score += len(categorized['low']) * 1        # 1 point per low
+            risk_score = min(risk_score, 100)  # Cap at 100
+
+            analysis['risk_score'] = risk_score
+
+            # Determine risk rating
+            if risk_score >= 50:
+                analysis['risk_rating'] = 'HIGH'
+            elif risk_score >= 25:
+                analysis['risk_rating'] = 'MEDIUM'
+            else:
+                analysis['risk_rating'] = 'LOW'
+
+            self.log(f"Permission analysis complete: {len(permissions)} permissions, Risk: {analysis['risk_rating']} ({risk_score}/100)")
+
+            return analysis
+
+        except Exception as e:
+            if self.verbose:
+                print(f"Warning: Failed to analyze permissions: {e}")
+            return None
+
     def validate_apk_structure(self, apk_path):
         """
         Validate APK/AAR file structure and detect malformed headers
@@ -1522,16 +1685,17 @@ class APKAnalyzer:
                 if validation['file_type'] == 'APK':
                     try:
                         manifest = apk.get_android_manifest_xml()
-                        if manifest:
-                            # Check for basic manifest structure
-                            manifest_elem = manifest.getElementsByTagName('manifest')
-                            if not manifest_elem:
+                        if manifest is not None:
+                            # Check for basic manifest structure (lxml Element, not DOM)
+                            if manifest.tag != 'manifest':
                                 validation['warnings'].append("AndroidManifest.xml missing <manifest> root element")
                             else:
-                                # Check for package name
-                                package = manifest_elem[0].getAttribute('android:package')
+                                # Check for package name (lxml uses .get() not .getAttribute())
+                                package = manifest.get('package')
                                 if not package:
                                     validation['warnings'].append("AndroidManifest.xml missing package name")
+                                else:
+                                    self.log(f"Package: {package}")
                         else:
                             validation['warnings'].append("Cannot parse AndroidManifest.xml")
                     except Exception as e:
@@ -2585,8 +2749,57 @@ class APKAnalyzer:
                 'strings': self.analyze_strings(sources),
                 'control_flow': self.analyze_control_flow(sources),
                 'resources': self.analyze_resources(file_path),  # Optional, returns None if androguard unavailable
-                'cryptography': self.analyze_cryptography(sources)  # Crypto analysis
+                'cryptography': self.analyze_cryptography(sources),  # Crypto analysis
+                'permissions': self.analyze_permissions(file_path)  # Permission analysis
             }
+
+            # Display permission summary with color-coding
+            perms = analysis.get('permissions')
+            if perms:
+                print(f"\n╔═══════════════════════════════════════════════════════════════╗")
+                print(f"║  AndroidManifest.xml Permission Analysis                    ║")
+                print(f"╚═══════════════════════════════════════════════════════════════╝")
+                print(f"\nPackage: {perms['package_name']}")
+                if perms['version_name']:
+                    print(f"Version: {perms['version_name']} (code: {perms['version_code']})")
+
+                print(f"\nTotal Permissions: {perms['total_permissions']}")
+                print(f"Risk Rating: {perms['risk_rating']} (Score: {perms['risk_score']}/100)")
+
+                # Color codes for terminal
+                RED = '\033[91m'
+                YELLOW = '\033[93m'
+                BLUE = '\033[94m'
+                GREEN = '\033[92m'
+                GRAY = '\033[90m'
+                RESET = '\033[0m'
+                BOLD = '\033[1m'
+
+                summary = perms['risk_summary']
+                if summary['critical_count'] > 0:
+                    print(f"\n{RED}{BOLD}🔴 CRITICAL ({summary['critical_count']}){RESET}")
+                    for p in perms['permissions_by_risk']['critical']:
+                        print(f"  {RED}• {p['short_name']}{RESET}")
+
+                if summary['high_count'] > 0:
+                    print(f"\n{YELLOW}{BOLD}🟠 HIGH ({summary['high_count']}){RESET}")
+                    for p in perms['permissions_by_risk']['high']:
+                        print(f"  {YELLOW}• {p['short_name']}{RESET}")
+
+                if summary['medium_count'] > 0:
+                    print(f"\n{BLUE}{BOLD}🔵 MEDIUM ({summary['medium_count']}){RESET}")
+                    for p in perms['permissions_by_risk']['medium']:
+                        print(f"  {BLUE}• {p['short_name']}{RESET}")
+
+                if summary['low_count'] > 0:
+                    print(f"\n{GREEN}{BOLD}🟢 LOW ({summary['low_count']}){RESET}")
+                    for p in perms['permissions_by_risk']['low']:
+                        print(f"  {GREEN}• {p['short_name']}{RESET}")
+
+                if summary['unknown_count'] > 0:
+                    print(f"\n{GRAY}{BOLD}⚪ UNKNOWN ({summary['unknown_count']}){RESET}")
+                    for p in perms['permissions_by_risk']['unknown']:
+                        print(f"  {GRAY}• {p['short_name']}{RESET}")
 
             # Assess obfuscation likelihood
             print("\nAssessing obfuscation likelihood...")

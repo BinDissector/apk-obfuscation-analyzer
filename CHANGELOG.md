@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fixed by changing function to accept `sources_dir` and use `os.walk()` like other analysis functions
   - Cryptographic analysis now works correctly and detects hardcoded keys, weak algorithms, etc.
 
+- **Critical**: Fixed AndroidManifest.xml parsing error
+  - Error: "'lxml.etree._Element' object has no attribute 'getElementsByTagName'"
+  - `get_android_manifest_xml()` returns lxml Element, not DOM object
+  - Fixed by using lxml methods: `.tag`, `.get()`, `.find()` instead of DOM methods
+  - Manifest validation now works correctly with proper encoding (UTF-8)
+
+### Added
+- **New Feature**: AndroidManifest.xml Permission Analysis with risk-based color-coding
+  - Extracts all permissions from manifest and categorizes by risk level
+  - Risk categories: CRITICAL (red), HIGH (yellow), MEDIUM (blue), LOW (green), UNKNOWN (gray)
+  - Calculates permission risk score (0-100) and rating (LOW/MEDIUM/HIGH)
+  - Color-coded terminal output for easy visual identification
+  - Classifies 60+ common Android permissions by security risk
+  - Includes package metadata (name, version code, version name)
+  - Integrated into single file analysis workflow
+
 ## [1.0.0] - 2025-01-01
 
 ### Fixed
