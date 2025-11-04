@@ -4,9 +4,15 @@
 # The tool relies on jadx (external tool) for APK decompilation
 
 # Optional: For enhanced analysis features
-# androguard>=3.4.0  # Advanced APK analysis (optional)
+# Uncomment the packages you want to use:
+
+# androguard>=3.4.0  # Resource obfuscation analysis (resources.arsc parsing) - RECOMMENDED
 # matplotlib>=3.5.0  # For generating charts (optional)
 # pandas>=1.5.0      # For data analysis (optional)
+
+# To enable resource analysis:
+#   pip install androguard
+# This adds analysis of Android resource files (resource names, string resources, etc.)
 
 # Note: jadx must be installed separately
 # Installation instructions: https://github.com/skylot/jadx

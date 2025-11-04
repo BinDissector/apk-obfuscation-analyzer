@@ -69,6 +69,7 @@ Look for:
 - **String Encryption Detection**: Identifies encrypted strings and Base64 encoding
 - **Control Flow Complexity**: Calculates cyclomatic complexity to detect control flow obfuscation
 - **Package Structure Analysis**: Detects package flattening and restructuring
+- **Resource Obfuscation Analysis**: Analyzes resource names and string resources from resources.arsc (requires androguard)
 - **Pattern Detection**: Identifies ProGuard/R8/DexGuard obfuscation patterns
 - **Comprehensive Reporting**: Generates both JSON data and visual HTML reports
 - **Batch Processing**: Analyze multiple APK/AAR pairs automatically
@@ -82,6 +83,13 @@ Look for:
 - **Python 3.6+**: Core language runtime
 - **jadx**: Java decompiler for APK analysis
   - Installation instructions: https://github.com/skylot/jadx
+
+### Optional
+
+- **androguard**: For resource obfuscation analysis (resources.arsc parsing)
+  - Installation: `pip install androguard`
+  - Enables analysis of Android resource files (resource names, string resources, etc.)
+  - Tool works without it, but resource analysis will be skipped
 
 ### Installing jadx
 
@@ -313,14 +321,14 @@ Total: 7/7 tests passed
 
 ### Obfuscation Score (0-100)
 
-The tool calculates a comprehensive score based on four categories:
+The tool calculates a comprehensive score based on five categories:
 
-- **Identifier Obfuscation (40 points)**: Measures name obfuscation effectiveness
+- **Identifier Obfuscation (35 points)**: Measures name obfuscation effectiveness
   - Single-character class/method names
   - Meaningful name reduction
   - Average identifier length
 
-- **String Obfuscation (30 points)**: Evaluates string protection
+- **String Obfuscation (25 points)**: Evaluates string protection
   - Encrypted string percentage
   - Base64 encoding detection
   - Decryption method presence
@@ -334,6 +342,11 @@ The tool calculates a comprehensive score based on four categories:
   - Package flattening
   - Package count reduction
   - Depth changes
+
+- **Resource Obfuscation (10 points)**: Analyzes resource file obfuscation (requires androguard)
+  - Resource name obfuscation
+  - String resource encryption
+  - Short/randomized resource names
 
 ### Score Interpretation
 
@@ -366,7 +379,8 @@ After analysis, you'll find these files in the output directory:
 4. **String Analysis**: String encryption and entropy data
 5. **Control Flow Complexity**: Complexity metrics and patterns
 6. **Package Structure**: Package organization analysis
-7. **Obfuscation Patterns**: Detected obfuscation techniques
+7. **Resource Analysis**: Resource names and string resources (if androguard is installed)
+8. **Obfuscation Patterns**: Detected obfuscation techniques
 
 ## Analysis Metrics Explained
 
@@ -401,6 +415,18 @@ After analysis, you'll find these files in the output directory:
 - **total_packages**: Number of Java packages
 - **avg_package_depth**: Average nesting level (e.g., com.example.app = 3)
 - **single_level_packages**: Flattened packages (depth = 1)
+
+### Resource Metrics (requires androguard)
+
+- **total_resources**: Total number of Android resources
+- **obfuscated_names**: Resources with very short or single-character names
+- **short_names**: Resources with ≤2 character names
+- **meaningful_names**: Resources containing dictionary words
+- **avg_name_length**: Average length of resource names
+- **total_strings**: String resources in resources.arsc
+- **encrypted_strings**: High-entropy string resources (likely encrypted)
+- **base64_strings**: String resources encoded in Base64
+- **avg_string_entropy**: Average randomness of string resources
 
 ### Obfuscation Patterns
 
@@ -556,7 +582,7 @@ For apps requiring these capabilities, evaluate commercial solutions like [Digit
 - **Approximations**: Complexity calculations are estimates based on decompiled code
 - **jadx Dependency**: Requires successful decompilation; heavily obfuscated APKs may fail
 - **No Native Code**: Does not analyze native libraries (.so files)
-- **No Resource Analysis**: Focuses on code only, not resources or assets
+- **Resource Analysis Optional**: Resource obfuscation analysis requires androguard (install with `pip install androguard`)
 
 ## Troubleshooting
 
