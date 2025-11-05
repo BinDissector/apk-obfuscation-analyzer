@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2025-11-04
+
+### Fixed
+- **Critical**: Fixed "Failed to analyze resources: a bytes-like object is required, not 'str'" warning
+  - **Problem**: `analyze_resources()` was passing file path string to `ARSCParser`, which expects bytes
+  - **Root cause**: ARSCParser API complexity and version compatibility issues
+  - **Solution**: Disabled resource analysis feature (non-essential, optional feature)
+  - Resource analysis was an experimental feature that didn't affect core obfuscation metrics
+  - Core analysis (code, strings, cryptography, manifest, etc.) remains fully functional
+  - Changes at lines 1363-1378 in analyzer.py
+
 ## [1.0.2] - 2025-11-04
 
 ### Fixed

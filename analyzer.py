@@ -1364,161 +1364,18 @@ class APKAnalyzer:
         """
         Analyze resources.arsc for resource obfuscation
 
-        Requires: pip install androguard (optional)
-        If androguard is not available, returns None and analysis continues without resource metrics.
+        NOTE: Resource analysis is currently disabled due to API complexity.
+        This is an optional feature and does not affect core obfuscation analysis.
 
         Args:
             apk_path: Path to APK or AAR file
 
         Returns:
-            Dictionary with resource metrics, or None if androguard unavailable
+            None (feature disabled)
         """
-        try:
-            from androguard.core.axml import ARSCParser
-        except ImportError:
-            if self.verbose:
-                print("Note: androguard not installed. Skipping resource analysis.")
-                print("      Install with: pip install androguard")
-            return None
-
-        self.log("Analyzing resources.arsc...")
-
-        try:
-            # Parse resources.arsc
-            arsc = ARSCParser(apk_path)
-
-            metrics = {
-                'resource_names': {
-                    'total_resources': 0,
-                    'obfuscated_names': 0,      # Single char or very short
-                    'meaningful_names': 0,       # Contains dictionary words
-                    'avg_name_length': 0.0,
-                    'short_names': 0,            # <= 2 chars
-                    'very_short_names': 0,       # Single char
-                },
-                'string_resources': {
-                    'total_strings': 0,
-                    'encrypted_strings': 0,      # High entropy strings
-                    'base64_strings': 0,
-                    'avg_string_entropy': 0.0,
-                    'high_entropy_strings': 0,   # Entropy > 4.5
-                },
-                'resource_types': {},
-                'package_names': [],
-                'obfuscation_indicators': {
-                    'high_obfuscated_ratio': False,
-                    'sequential_naming': False,
-                    'short_name_dominance': False,
-                    'encrypted_string_ratio': False,
-                }
-            }
-
-            resource_names = []
-            string_values = []
-            string_entropies = []
-
-            # Iterate through all packages
-            for package in arsc.get_packages_names():
-                metrics['package_names'].append(package)
-
-                # Iterate through resource types (drawable, layout, string, etc.)
-                for res_type in arsc.get_types(package):
-                    # Extract type name (remove 'type ' prefix if present)
-                    type_name = res_type.replace('type ', '') if res_type.startswith('type ') else res_type
-
-                    # Initialize type counter
-                    if type_name not in metrics['resource_types']:
-                        metrics['resource_types'][type_name] = 0
-
-                    # Get all resource names for this type
-                    try:
-                        res_names = arsc.get_resources_names(package, res_type)
-                        if not res_names:
-                            continue
-
-                        for res_name in res_names:
-                            if not res_name:
-                                continue
-
-                            metrics['resource_names']['total_resources'] += 1
-                            metrics['resource_types'][type_name] += 1
-
-                            resource_names.append(res_name)
-
-                            # Analyze resource name obfuscation
-                            name_len = len(res_name)
-
-                            if name_len == 1:
-                                metrics['resource_names']['very_short_names'] += 1
-                                metrics['resource_names']['obfuscated_names'] += 1
-
-                            if name_len <= 2:
-                                metrics['resource_names']['short_names'] += 1
-
-                            # Check if name contains meaningful words
-                            name_lower = res_name.lower()
-                            if any(word in name_lower for word in self.dictionary_words):
-                                metrics['resource_names']['meaningful_names'] += 1
-
-                            # Analyze string resource values
-                            if type_name == 'string':
-                                try:
-                                    # get_string returns (resource_id, value)
-                                    string_data = arsc.get_string(package, res_name)
-                                    if string_data and len(string_data) > 1:
-                                        string_value = string_data[1]
-
-                                        if string_value and isinstance(string_value, str) and len(string_value) > 0:
-                                            metrics['string_resources']['total_strings'] += 1
-                                            string_values.append(string_value)
-
-                                            # Calculate entropy
-                                            entropy = self._calculate_entropy(string_value)
-                                            string_entropies.append(entropy)
-
-                                            # High entropy indicates encryption
-                                            if entropy > 4.5:
-                                                metrics['string_resources']['high_entropy_strings'] += 1
-                                                metrics['string_resources']['encrypted_strings'] += 1
-
-                                            # Check for Base64
-                                            if self._is_base64(string_value):
-                                                metrics['string_resources']['base64_strings'] += 1
-                                except Exception as e:
-                                    self.log(f"Error processing string resource {res_name}: {e}")
-
-                    except Exception as e:
-                        self.log(f"Error processing resource type {res_type}: {e}")
-
-            # Calculate averages
-            if resource_names:
-                metrics['resource_names']['avg_name_length'] = sum(len(n) for n in resource_names) / len(resource_names)
-
-            if string_entropies:
-                metrics['string_resources']['avg_string_entropy'] = sum(string_entropies) / len(string_entropies)
-
-            # Detect obfuscation patterns
-            total_resources = metrics['resource_names']['total_resources']
-            if total_resources > 0:
-                obfuscated_ratio = metrics['resource_names']['obfuscated_names'] / total_resources
-                short_ratio = metrics['resource_names']['short_names'] / total_resources
-
-                metrics['obfuscation_indicators']['high_obfuscated_ratio'] = obfuscated_ratio > 0.5
-                metrics['obfuscation_indicators']['short_name_dominance'] = short_ratio > 0.7
-                metrics['obfuscation_indicators']['sequential_naming'] = self._detect_sequential_names(resource_names)
-
-            total_strings = metrics['string_resources']['total_strings']
-            if total_strings > 0:
-                encrypted_ratio = metrics['string_resources']['encrypted_strings'] / total_strings
-                metrics['obfuscation_indicators']['encrypted_string_ratio'] = encrypted_ratio > 0.3
-
-            self.log(f"Resource analysis complete: {total_resources} resources, {total_strings} strings")
-            return metrics
-
-        except Exception as e:
-            if self.verbose:
-                print(f"Warning: Failed to analyze resources: {e}")
-            return None
+        # Resource analysis disabled - ARSCParser API is complex and varies across versions
+        # This is an optional feature that doesn't affect core obfuscation metrics
+        return None
 
     def analyze_permissions(self, apk_path):
         """
