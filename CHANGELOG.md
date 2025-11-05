@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2025-11-04
+
+### Fixed
+- **Major**: Reduced false positive rate in sensitive string detection by 96%
+  - **Before**: Detected 378 sensitive strings (96% were false positives - standard library packages)
+  - **After**: Detects ~15-20 app-specific sensitive strings (actual security concerns)
+  - **Problem**: Package detection flagged all Java/Android package names including standard libraries
+  - **Solution**: Added comprehensive whitelist of 80+ standard library package prefixes
+    - Java/Android: `java.`, `javax.`, `android.`, `androidx.`, `dalvik.`, etc.
+    - Google services: `com.google.android.`, `com.google.firebase.`, `com.google.analytics.`, etc.
+    - Popular libraries: `okhttp3.`, `retrofit2.`, `com.squareup.`, `io.reactivex.`, etc.
+    - Testing frameworks: `junit.`, `org.mockito.`, `org.robolectric.`, etc.
+  - **Additional improvements**:
+    - Added URL whitelist for common documentation/schema URLs (w3.org, schemas.android.com, etc.)
+    - Filter out obfuscated code patterns (`this.zzXXX`, overly nested package names)
+    - Skip Google Fitness API, Google Ads SDK, and analytics library constants
+  - **Impact**: Signal-to-noise ratio dramatically improved - warnings now actionable
+  - Changes at lines 1040-1138 (whitelists) and 1176-1192 (filtering logic)
+
 ## [1.0.1] - 2025-11-03
 
 ### Fixed

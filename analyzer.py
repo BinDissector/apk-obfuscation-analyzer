@@ -1036,6 +1036,112 @@ class APKAnalyzer:
             'total_sensitive': 0
         }
 
+        # Whitelist of standard library packages (to reduce false positives)
+        STANDARD_PACKAGE_PREFIXES = {
+            'java.', 'javax.', 'sun.', 'com.sun.',
+            'android.', 'androidx.', 'com.android.',
+            'com.google.android.', 'com.google.firebase.', 'com.google.gson.',
+            'com.google.analytics.', 'com.google.location.', 'com.google.step_count.',
+            'com.google.activity.', 'com.google.ads.', 'com.google.distance.',
+            'com.google.calories.', 'com.google.body.', 'com.google.cycling.',
+            'com.google.fitness.', 'com.google.heart_rate.', 'com.google.height.',
+            'com.google.weight.', 'com.google.speed.', 'com.google.power.',
+            'com.google.nutrition.', 'com.google.level_change.', 'com.google.accelerometer.',
+            'com.google.cast.', 'com.google.speed.', 'com.google.height.', 'com.google.weight.',
+            'com.google.analytics.', 'com.google.ads.',
+            'www.googleapis.com', 'googleads.g.doubleclick.net',
+            'ad.doubleclick.net', 'schemas.android.com',
+            'www.googletagmanager.com', 'login.yahoo.com', 'accounts.google.com',
+            'plus.google.com', 'csi.gstatic.com', 'www.facebook.com',
+            'www.linkedin.com', 'login.live.com', 'www.google.com',
+            'vnd.google.', 'vnd.android.', 'analytics.', 'gcm.', 'press.', 'raise.', 'bridge.',
+            'mobileads.google.', 'googlesyndication.', 'pagead2.googlesyndication.',
+            'org.apache.', 'org.xml.', 'org.w3c.', 'org.json.',
+            'kotlin.', 'kotlinx.', 'scala.', 'groovy.',
+            'org.junit.', 'org.mockito.', 'org.hamcrest.',
+            'com.squareup.', 'io.reactivex.', 'io.netty.',
+            'okhttp3.', 'retrofit2.', 'com.jakewharton.',
+            'org.slf4j.', 'ch.qos.logback.', 'org.apache.log4j.',
+            'com.fasterxml.jackson.', 'org.codehaus.',
+            'org.springframework.', 'org.hibernate.',
+            'dalvik.', 'libcore.', 'com.android.internal.',
+            'junit.', 'org.testng.', 'org.robolectric.',
+            'com.google.common.', 'com.google.guava.',
+            'org.jetbrains.', 'io.ktor.', 'kotlinx.coroutines.',
+            'com.facebook.', 'com.twitter.', 'com.linkedin.',
+            'org.objectweb.', 'net.sf.', 'org.bouncycastle.',
+            'javax.inject.', 'dagger.', 'com.google.dagger.',
+            'butterknife.', 'com.jakewharton.butterknife.',
+            'glide.', 'com.bumptech.glide.', 'com.squareup.picasso.',
+            'leakcanary.', 'com.squareup.leakcanary.',
+            'timber.', 'com.jakewharton.timber.',
+            'realm.', 'io.realm.', 'com.realm.',
+            'greenrobot.', 'org.greenrobot.',
+            'rxjava.', 'rx.', 'io.reactivex.rxjava',
+            'bolts.', 'com.parse.bolts.',
+            'fresco.', 'com.facebook.fresco.',
+            'lottie.', 'com.airbnb.lottie.',
+            'material.', 'com.google.android.material.',
+            'support.', 'android.support.',
+            'play.', 'com.google.android.gms.', 'com.google.android.play.',
+            'maps.', 'com.google.android.maps.',
+            'admob.', 'com.google.android.ads.',
+            'crashlytics.', 'com.crashlytics.',
+            'flurry.', 'com.flurry.',
+            'mixpanel.', 'com.mixpanel.',
+            'amplitude.', 'com.amplitude.',
+            'segment.', 'com.segment.',
+        }
+
+        # Common non-sensitive URL patterns (documentation, schemas, etc.)
+        COMMON_URL_WHITELIST = {
+            'http://www.w3.org/',
+            'https://www.w3.org/',
+            'http://schemas.android.com/',
+            'https://schemas.android.com/',
+            'http://www.apache.org/',
+            'https://www.apache.org/',
+            'http://xmlns.jcp.org/',
+            'https://xmlns.jcp.org/',
+            'http://java.sun.com/',
+            'https://java.sun.com/',
+            'http://example.com/',
+            'https://example.com/',
+            'http://localhost',
+            'https://localhost',
+            'http://127.0.0.1',
+            'http://0.0.0.0',
+            'http://schema.org/',
+            'https://schema.org/',
+            'http://purl.org/',
+            'https://purl.org/',
+            'http://www.google.com/schemas/',
+            'https://www.google.com/schemas/',
+            'http://developer.android.com/',
+            'https://developer.android.com/',
+            'http://tools.android.com/',
+            'https://tools.android.com/',
+            'https://www.googleapis.com/',
+            'http://www.googleapis.com/',
+            'https://googleads.g.doubleclick.net/',
+            'https://pagead2.googlesyndication.com/',
+            'https://www.googletagmanager.com',
+            'https://www.google-analytics.com',
+            'http://www.google-analytics.com',
+            'https://ssl.google-analytics.com',
+            'https://csi.gstatic.com/',
+            'https://accounts.google.com',
+            'https://login.yahoo.com',
+            'https://www.facebook.com',
+            'https://twitter.com',
+            'https://www.linkedin.com',
+            'https://login.live.com',
+            'http://plus.google.com/',
+            'http://www.google.com',
+            'https://www.google.com',
+            'http://hostname/',
+        }
+
         # Regex patterns for sensitive data
         api_key_patterns = [
             # AWS
@@ -1091,19 +1197,31 @@ class APKAnalyzer:
                     is_sensitive = True
                     break
 
-            # Check for URLs
+            # Check for URLs (excluding common documentation/schema URLs)
             if url_pattern.search(string):
-                sensitive['urls'].append(string[:150])
-                is_sensitive = True
+                # Check if it's a whitelisted common URL
+                is_whitelisted_url = any(string.startswith(prefix) for prefix in COMMON_URL_WHITELIST)
+                if not is_whitelisted_url:
+                    sensitive['urls'].append(string[:150])
+                    is_sensitive = True
 
-            # Check for package names (only if looks like Android/Java package)
+            # Check for package names (only if looks like Android/Java package AND not standard library)
             pkg_match = package_pattern.search(string)
             if pkg_match and not is_sensitive:
                 pkg = pkg_match.group(0)
-                # Filter out common false positives
-                if len(pkg) > 10 and '.' in pkg and not any(x in pkg for x in ['example', 'test', 'demo']):
-                    sensitive['package_names'].append(pkg)
-                    is_sensitive = True
+                # Check if it's a standard library package (whitelist)
+                is_standard_lib = any(pkg.startswith(prefix) for prefix in STANDARD_PACKAGE_PREFIXES)
+                # Filter out obfuscated code patterns (this.zzXXX, contains 'zz', etc.)
+                is_obfuscated_pattern = ('this.' in pkg or
+                                        pkg.startswith('zz') or
+                                        '.zz' in pkg or
+                                        pkg.count('.') > 5)  # Overly nested is likely obfuscated
+                # Only flag as sensitive if it's NOT a standard library and looks like custom package
+                if not is_standard_lib and not is_obfuscated_pattern and len(pkg) > 10 and '.' in pkg:
+                    # Additional filtering for common test/demo packages
+                    if not any(x in pkg for x in ['example', 'test', 'demo']):
+                        sensitive['package_names'].append(pkg)
+                        is_sensitive = True
 
             # Check for emails
             if email_pattern.search(string):
